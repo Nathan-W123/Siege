@@ -42,7 +42,6 @@ from PIL import Image
 
 from src.live.harvest import Sprite, SpriteLibrary
 from src.live.vision import DEFAULT_TEAM_COLORS, TEAM_FRIENDLY, TEAM_HOSTILE, rgb_to_hsv
-from src.simulator.constants import CardType
 
 
 @dataclass(frozen=True)

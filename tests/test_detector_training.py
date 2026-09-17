@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 
-import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -26,7 +25,6 @@ from src.live.homography import Homography
 from src.live.synth import SynthConfig, build_dataset
 from src.live.train_detector import SceneDataset, _collate, evaluate, train
 from src.live.vision import TEAM_FRIENDLY
-from src.simulator.cards import load_arena
 from src.simulator.constants import CardType
 from tests.live_frames import render_empty, render_unit_with_body
 

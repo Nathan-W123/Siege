@@ -317,7 +317,6 @@ def detector_loss(outputs, targets, weights=(1.0, 0.1, 1.0, 0.5, 0.5)):
     in pixels while everything else is a probability: left at parity its
     gradients dominate and the heatmap never sharpens.
     """
-    import torch
     import torch.nn.functional as F
 
     w_hm, w_size, w_off, w_team, w_kind = weights

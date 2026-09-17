@@ -12,7 +12,6 @@ from PIL import Image
 
 from src.live.harvest import (
     HarvestConfig,
-    Sprite,
     SpriteLibrary,
     build_plate,
     close_mask,
@@ -123,7 +122,7 @@ def test_harvested_alpha_covers_the_body_and_the_bar(arena, plate):
 
 def test_a_swarm_yields_several_bodies(arena, plate):
     """`count` is what keeps three skeletons from harvesting as one blob."""
-    from tests.live_frames import render_frame, PlannedUnit, _draw_disc, BODY_RGB
+    from tests.live_frames import render_frame, _draw_disc, BODY_RGB
     from tests.live_frames import perspective_camera
 
     image, _ = render_frame(arena, [])

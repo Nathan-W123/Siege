@@ -9,13 +9,9 @@ from __future__ import annotations
 import pytest
 
 from src.live.homography import Homography
-from src.live.spells import SpellConfig, SpellWatcher, resolve_identity
+from src.live.spells import SpellWatcher, resolve_identity
 from src.simulator.cards import load_cards
-from tests.live_frames import (
-    PlannedUnit,
-    render_march_sequence,
-    render_spell_sequence,
-)
+from tests.live_frames import render_march_sequence, render_spell_sequence
 
 
 def _homography(arena, meta):

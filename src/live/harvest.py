@@ -51,7 +51,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 
 from src.live.vision import TEAM_FRIENDLY, connected_components
 from src.simulator.constants import CardType

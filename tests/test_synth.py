@@ -15,7 +15,6 @@ import pytest
 from src.live.harvest import HarvestConfig, SpriteLibrary, build_plate, harvest
 from src.live.homography import Homography
 from src.live.synth import (
-    Annotation,
     SynthConfig,
     build_dataset,
     compose_scene,

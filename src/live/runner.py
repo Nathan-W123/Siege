@@ -93,7 +93,7 @@ class LiveMatchRunner:
         downstream is invented, and the policy would confidently play cards
         that are not available.
         """
-        from src.live.bridge import LiveObservation, PerceivedSpell, PerceivedUnit
+        from src.live.bridge import LiveObservation, PerceivedUnit
         from src.live.vision import TEAM_HOSTILE, detect_units, read_elixir
 
         config = self.config
