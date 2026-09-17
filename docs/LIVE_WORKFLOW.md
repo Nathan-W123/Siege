@@ -60,14 +60,18 @@ vision pipeline is currently tested only against synthetic frames.
 
 1. `python -m src.live --diagnose` to capture a frame and print what match
    and ready detection actually see.
-2. Record an **empty arena** (a few seconds, no units) and a deploy pass:
-   place each card in your deck alone and record it. This is the input to
-   the label-free pipeline and it is the only manual step in it — you are
-   playing the cards, not labelling anything.
+2. **Just play.** There is no empty-arena recording and no deploy pass.
+   `background.RunningPlate` learns the empty arena from ordinary play,
+   `discover.EntityDiscoverer` finds new units and classifies them by
+   geometry alone, and `autolabel.SpriteHarvester` names them — ours from
+   the deterministic hand cycle, theirs from the opponent tracker's
+   deduction — and grows the sprite library as the match runs.
+
+   Then composite and train:
 
    ```bash
-   # harvest -> composite -> train; see README, "Training the detector
-   # without labelling anything"
+   # see README, "Training the detector without labelling anything,
+   # or staging anything"
    python -m src.live.train_detector --manifest data/synth/manifest.json \
        --out checkpoints/detector.pt --epochs 20
    ```

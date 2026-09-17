@@ -200,6 +200,10 @@ def test_overfits_a_single_scene():
     offset or a size means, this is the only test that notices -- the model
     still trains and the loss still falls.
     """
+    # Seeded: without it the initialisation depends on whatever RNG the
+    # tests before this one consumed, and an unlucky init turns a
+    # convergence assertion into a coin flip that fails only in full runs.
+    torch.manual_seed(0)
     config = _config(score_threshold=0.2, identity_threshold=0.2)
     model = build_detector(config)
     annotations = [_annotation(card="cannon", kind="building", team="friendly",
@@ -211,7 +215,7 @@ def test_overfits_a_single_scene():
     image[0, :, 24:48, 20:36] = 1.0
 
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
-    for _ in range(200):
+    for _ in range(400):
         optimizer.zero_grad()
         loss, _ = detector_loss(model(image), targets)
         loss.backward()

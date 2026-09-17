@@ -492,71 +492,90 @@ worse than having none. `tests/live_frames.py` documents the fixture format
 and generates synthetic frames; drop real annotated captures into
 `tests/fixtures/live/` and the test suite picks them up automatically.
 
-### Training the detector without labelling anything
+### Training the detector without labelling anything, or staging anything
 
-The detector needs labelled data and nobody labels any. Four steps, each
-producing labels as a byproduct of something you were doing anyway.
+Nobody labels a frame and nobody deploys a card onto an empty board. You
+play matches; the pipeline does the rest.
 
-**1. Harvest** (`src/live/harvest.py`). Deploy a known card onto an empty
-arena and difference the frame against a plate of that same arena. What is
-left is that card's pixels with a pixel-exact alpha, named because you chose
-it; stepping the frames yields every animation pose and facing. The plate is
-a median, not a mean — the arena is never still, and a mean smears the river
-animation into the plate where it subtracts forever after as a faint
-permanent sprite.
+**1. The background builds itself** (`src/live/background.py`). Harvesting a
+clean sprite needs an empty-arena reference, which used to mean recording
+one. It does not: over any stretch of real play, every pixel of the
+playfield is background most of the time, so the running per-pixel median
+*is* the empty arena. A Σ-Δ estimator keeps one in constant memory. It also
+tracks frame-to-frame activity, so continuously animated background — the
+river, lingering VFX — is masked out instead of reading as a permanent wall
+of foreground.
 
-The assumption worth naming: you never need the *opponent* to show you a
-card to learn what it looks like. A card's sprite is the same sprite whoever
-plays it, and only the health bar is team-tinted — one hue rotation away
-(`synth.recolor_team`).
+**2. New units are found and classified by geometry** (`src/live/discover.py`).
+No model, no template, no label:
 
-**With one real limit.** You play from the bottom, so your troops walk up
-the board and show their backs while the opponent's walk down and show their
-fronts, and those are separate art — no flip turns one into the other. A
-retinted friendly sprite is therefore a truthful enemy example of *where*,
-*whose*, *how big* and *what kind*, and a false one of *which card*. Those
-examples are marked `identity_supervised=False`, train a trailing
-"entity, card unknown" heatmap channel instead of a card channel, and have
-the card channels' loss masked where they sit — so the model is never taught
-that an enemy Knight looks like the back of one. Enemy card identity arrives
-in step 4 instead, from real frames facing the right way.
+| Question | Answer | Why it cannot be broken by a skin |
+|---|---|---|
+| Where is it? | foreground against the running plate | it is a difference, not a colour |
+| Troop or building? | did it move over the last second? | buildings do not move |
+| Whose is it? | did it walk *up* the screen or *down*? | you always occupy the bottom seat |
 
-**2. Composite** (`src/live/synth.py`). Harvested sprites were alone on an
-empty board, so paste them back at random tiles in random overlapping
+Spells never persist that long and are handled by `src/live/spells.py`
+before they reach here.
+
+**3. Naming, from two sources that already exist.** Ours is not deduced but
+*known* — `runner.HandCycle` simulates the deck cycle deterministically, so
+at the moment we tap we know the card. Theirs comes from
+`autolabel.resolve_spawn`, stacking what the cycle tracker knows (their
+deck, their hand, what they can afford) against what geometry saw (kind, and
+how many bodies landed at once). Three bodies at once is a card with
+`count == 3`, which cuts most of the roster in one step. One survivor is a
+deduction; more than one banks nothing.
+
+`autolabel.SpriteHarvester` puts those together and grows the sprite library
+while you play. **A sprite cut from a real enemy is the front view** — the
+one a harvest from your own deploys can never produce, and the one the
+detector needs to name enemies at all.
+
+**4. Composite and train** (`src/live/synth.py`). Harvested sprites were
+each alone, so paste them back at random tiles in random overlapping
 combinations. Because it placed them, it knows every box, class, kind and
-team exactly. Sprites are rescaled by the perspective ratio between where
-they were harvested and where they land — the homography knows that factor —
-and scenes paint back to front so nearer units occlude farther ones, the
-only occlusion order the game produces. Occlusion is *measured* with an
-owner map, and a sprite left too buried loses its annotation rather than
-teaching the detector to hallucinate units behind units.
+team exactly. Sprites rescale by the perspective ratio between where they
+were harvested and where they land — the homography knows that factor — and
+scenes paint back to front so nearer units occlude farther ones. Occlusion
+is *measured* with an owner map, and a sprite left too buried loses its
+annotation rather than teaching the detector to hallucinate units behind
+units.
 
 ```bash
 python -m src.live.train_detector --manifest data/synth/manifest.json \
     --out checkpoints/detector.pt --epochs 20
 ```
 
-**3. Watch recall, not loss.** Detection losses fall smoothly while the
-model still finds nothing — background cells dominate them. Training reports
+**Watch recall, not loss.** Detection losses fall smoothly while a model
+still finds nothing — background cells dominate them. Training reports
 centre recall and identity accuracy, which are also the two failure modes in
 play: a miss is a blind spot, a wrong name is a bad trade, and only the
 second is recoverable.
 
-**4. Self-label** (`src/live/autolabel.py`). Synthetic scenes are wrong in
-ways that only show on a real frame: real pushes clump along lanes, harvest
-artifacts repeat thousands of times, nothing is ever drawn mid-death.
-`OpponentTracker` fixes this for free — by the time a card is played it
-knows the deck, the hand, and what they can afford. Stack that against the
-detector's kind and the number of bodies that appeared at once (three
-together is a card with `count == 3`) and the answer is usually forced. One
-survivor is a deduction, not a guess, and the crop under it is a labelled
-example on a real frame in your skin at your resolution. More than one
-survivor banks nothing.
+**5. The loop closes.** With a detector, `autolabel.SelfLabeler` banks real
+frames the cycle tracker can name, and `Discovery` and `DetectedEntity` are
+deliberately interchangeable — geometry bootstraps the loop and the detector
+takes over through the same path. Play, bank, retrain, play. A new arena
+skin or a new season is a night of self-labelling rather than an afternoon
+of anyone's time.
 
-Banked frames use the same manifest format as the synthetic ones, so a
-training run mixes them by pointing at both. Play, bank, retrain, play — a
-new arena skin or a new season becomes a night of self-labelling rather than
-an afternoon of anyone's time.
+#### The facing problem
+
+You play from the bottom, so your troops walk up the board and show their
+backs while the opponent's walk down and show their fronts — separate art,
+and no flip turns one into the other.
+
+So a friendly sprite retinted into an enemy (`synth.recolor_team`) is a
+truthful example of *where*, *whose*, *how big* and *what kind*, and a false
+one of *which card*. Those are marked `identity_supervised=False`, train a
+trailing "entity, card unknown" heatmap channel instead of a card channel,
+and have the card channels' loss masked where they sit — so the model is
+never taught that an enemy Knight looks like the back of one.
+
+That empty name is the handoff, not a loss: `autolabel` needs the detector
+to *find* an enemy, not to name it. Enemy identity arrives from step 3,
+where the sprite was observed walking toward the camera.
 
 ---
 

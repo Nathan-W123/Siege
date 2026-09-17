@@ -277,3 +277,137 @@ def test_banked_frames_load_through_the_training_dataset(cards, frame, tmp_path)
     assert image.shape == (3, 64, 64)
     assert targets["heatmap"].shape[0] == 2   # one card plus the unnamed channel
     assert annotations[0]["card"] == "cannon"
+
+
+# ---------------------------------------- growing the library without a pass
+
+
+def _discovery(kind=CardType.TROOP, team="hostile", count=1,
+               team_source="motion", area=20):
+    """A stand-in for `discover.Discovery` with a real alpha mask."""
+    from src.live.discover import Discovery
+
+    return Discovery(
+        kind=kind, team=team, x0=90.0, y0=170.0, x1=110.0, y1=200.0,
+        rgb=np.zeros((30, 20, 3), np.uint8),
+        alpha=np.ones((area, area), bool),
+        count=count, team_source=team_source)
+
+
+def test_our_own_spawns_are_named_by_the_hand_cycle(cards):
+    """Not deduced — known. The cycle is deterministic, so at the moment we
+    tap we know exactly which card we played."""
+    from src.live.autolabel import SpriteHarvester
+
+    harvester = SpriteHarvester(cards)
+
+    banked = harvester.observe([_discovery(team="friendly")], own_card="knight")
+
+    assert [s.card for s in banked] == ["knight"]
+    assert banked[0].facing == "away", "our units walk up the board"
+
+
+def test_enemy_spawns_are_named_by_the_tracker(cards):
+    """And this is the one that matters: a sprite cut from a real enemy is
+    the front view, which a harvest from our own deploys can never produce."""
+    from src.live.autolabel import SpriteHarvester
+
+    harvester = SpriteHarvester(cards)
+    tracker = _Tracker(["cannon", "knight", "archers", "fireball"])
+
+    banked = harvester.observe([_discovery(kind=CardType.BUILDING,
+                                           team_source="bar")], tracker=tracker)
+
+    assert [s.card for s in banked] == ["cannon"]
+    assert banked[0].facing == "toward"
+
+
+def test_a_friendly_spawn_with_no_recent_play_is_skipped(cards):
+    """Spawned troops (a Witch's skeletons, a hut's goblins) appear without
+    a tap. Attributing them to whatever we played last would poison the
+    library with the wrong card's pixels."""
+    from src.live.autolabel import SpriteHarvester
+
+    harvester = SpriteHarvester(cards)
+
+    assert harvester.observe([_discovery(team="friendly")]) == []
+    assert "no recent play" in harvester.skipped[-1]
+
+
+def test_a_troop_whose_team_was_guessed_is_not_banked(cards):
+    """Facing follows team, so a shaky team read files a back view under a
+    front-facing label — exactly the error the facing split exists to stop."""
+    from src.live.autolabel import SpriteHarvester
+
+    harvester = SpriteHarvester(cards)
+    tracker = _Tracker(["knight", "archers", "fireball", "giant"])
+
+    banked = harvester.observe([_discovery(kind=CardType.TROOP,
+                                           team_source="side")], tracker=tracker)
+
+    assert banked == []
+    assert "motion" in harvester.skipped[-1]
+
+
+def test_a_building_may_use_a_fallback_team(cards):
+    """A building is drawn the same way whoever owns it, so it has no facing
+    to get wrong and a fallback team read costs nothing."""
+    from src.live.autolabel import SpriteHarvester
+
+    harvester = SpriteHarvester(cards)
+    tracker = _Tracker(["cannon", "knight", "archers", "fireball"])
+
+    banked = harvester.observe([_discovery(kind=CardType.BUILDING,
+                                           team_source="side")], tracker=tracker)
+
+    assert [s.card for s in banked] == ["cannon"]
+
+
+def test_an_ambiguous_enemy_spawn_is_skipped(cards):
+    from src.live.autolabel import SpriteHarvester
+
+    harvester = SpriteHarvester(cards)
+
+    assert harvester.observe([_discovery()]) == []      # no tracker, no prior
+    assert "no deck prior" in harvester.skipped[-1]
+
+
+def test_a_scrap_of_a_sprite_is_not_banked(cards):
+    """A twenty-pixel fragment is a segmentation failure, and pasting it a
+    thousand times teaches the detector that failure."""
+    from src.live.autolabel import SpriteHarvester
+
+    harvester = SpriteHarvester(cards, min_area=200)
+
+    assert harvester.observe([_discovery(team="friendly", area=5)],
+                             own_card="knight") == []
+
+
+def test_the_library_grows_across_a_match(cards):
+    """The whole claim: play normally, and the library fills itself."""
+    from src.live.autolabel import SpriteHarvester
+
+    harvester = SpriteHarvester(cards)
+    tracker = _Tracker(["cannon", "knight", "archers", "fireball"])
+
+    harvester.observe([_discovery(team="friendly")], own_card="knight")
+    harvester.observe([_discovery(team="friendly")], own_card="giant")
+    harvester.observe([_discovery(kind=CardType.BUILDING)], tracker=tracker)
+
+    assert harvester.library.cards == ["cannon", "giant", "knight"]
+    assert len(harvester.library) == 3
+
+
+def test_a_discovery_feeds_the_labeller_unchanged(cards, frame):
+    """`Discovery` and `DetectedEntity` are interchangeable on purpose --
+    geometry bootstraps the loop and the detector takes over through the
+    same path, with nothing in between having to know which it got."""
+    labeler = SelfLabeler(cards, CONFIG)
+    tracker = _Tracker(["cannon", "knight", "archers", "fireball"])
+    spawn = _discovery(kind=CardType.BUILDING)
+
+    banked = []
+    for i in range(4):
+        banked.extend(labeler.observe(frame, [spawn], i * 0.05, tracker))
+
+    assert [b.card for b in banked] == ["cannon"]

@@ -280,3 +280,37 @@ def render_empty(arena, size=FRAME_SIZE, with_hud_distractor: bool = True):
     image, meta = render_frame(arena, [], size=size,
                                with_hud_distractor=with_hud_distractor)
     return image, meta
+
+
+def render_scene_with_bodies(arena, placements, size=FRAME_SIZE,
+                             with_hud_distractor: bool = True):
+    """Several units, each drawn as a body plus its health bar.
+
+    `placements` is [(tile, team), ...]. Used for the model-free discovery
+    tests, which need a stream of frames where units move and buildings do
+    not -- geometry is the only signal there, so the fixture has to get the
+    geometry right even though the art is a disc.
+    """
+    project = perspective_camera(arena, size)
+    image, meta = render_frame(
+        arena, [PlannedUnit(team, tile, 1.0) for tile, team in placements],
+        size=size, with_hud_distractor=with_hud_distractor)
+    frame = np.array(image)
+    for tile, _ in placements:
+        feet_x, feet_y = project(*tile)
+        _draw_disc(frame, feet_x, feet_y - BODY_RADIUS, BODY_RADIUS, BODY_RGB)
+    return Image.fromarray(frame), meta
+
+
+def warmup_frames(arena, count=80, size=FRAME_SIZE):
+    """A stretch of ordinary play: one unit wandering, never parked.
+
+    This is what a `RunningPlate` is fed in real use -- nobody records an
+    empty arena, they just play -- so the tests build their plate the same
+    way rather than from a staged empty capture.
+    """
+    frames = []
+    for i in range(count):
+        tile = (3.0 + (i % 13), 18.0 + (i % 7))
+        frames.append(render_scene_with_bodies(arena, [(tile, "hostile")], size=size)[0])
+    return frames

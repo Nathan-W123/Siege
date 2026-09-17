@@ -59,7 +59,9 @@ from pathlib import Path
 
 import numpy as np
 
+from src.live.harvest import Sprite, SpriteLibrary
 from src.live.synth import Annotation
+from src.live.vision import TEAM_FRIENDLY
 from src.simulator.constants import CardType
 
 
@@ -345,3 +347,93 @@ class LabelStore:
         path.write_text(json.dumps({"cards": sorted(self.cards),
                                     "scenes": self.scenes}))
         return path
+
+
+# ------------------------------------------------- growing the sprite library
+
+
+def name_discovery(discovery, cards: dict, tracker=None,
+                   own_card: str | None = None) -> tuple[str, str]:
+    """Name a model-free `discover.Discovery`, or return ("", reason).
+
+    The two teams are named by completely different means, and neither
+    involves a label or a model.
+
+    **Ours** is not deduced at all — it is *known*. `runner.HandCycle`
+    simulates the deck cycle deterministically, so at the moment we tap we
+    know exactly which card we played. Anything friendly that appears right
+    after is that card.
+
+    **Theirs** goes through `resolve_spawn`, which stacks what the cycle
+    tracker knows (their deck, their hand, what they can afford) against what
+    geometry saw (kind, and how many bodies landed at once).
+    """
+    if discovery.team == TEAM_FRIENDLY:
+        if own_card:
+            return own_card, "our own deploy, named by the hand cycle"
+        return "", "friendly spawn with no recent play of ours to attribute it to"
+
+    candidates, elixir_max = [], None
+    if tracker is not None:
+        candidates = tracker.possible_hand() or tracker.candidate_cards()
+        elixir_max = tracker.elixir_range[1]
+    return resolve_spawn(discovery.kind, discovery.count, cards,
+                         candidates, elixir_max)
+
+
+class SpriteHarvester:
+    """Grows a `SpriteLibrary` out of ordinary matches, with no deploy pass.
+
+    This is what removes the last manual step. `harvest.py` can cut a clean
+    sprite out of any frame given a background plate, and
+    `background.RunningPlate` builds that plate from live play; `discover.py`
+    finds new entities and says what kind and whose they are from geometry
+    alone; and the two naming routes above supply the card. Put together,
+    the library fills itself while you play the game normally, and nobody
+    ever deploys a hundred cards onto an empty board to seed it.
+
+    Facing is the reason this is worth doing rather than merely convenient.
+    A sprite cut from a real enemy was *observed* walking down the board, so
+    it is the front view — the one a harvest from your own deploys can never
+    produce, and the one the detector needs in order to name enemies at all.
+    """
+
+    def __init__(self, cards: dict, library: SpriteLibrary | None = None,
+                 min_area: int = 60, require_motion_team: bool = True):
+        self.cards = cards
+        self.library = library if library is not None else SpriteLibrary()
+        self.min_area = min_area
+        self.require_motion_team = require_motion_team
+        self.skipped: list[str] = []
+
+    def observe(self, discoveries, tracker=None,
+                own_card: str | None = None) -> list[Sprite]:
+        """Bank whatever can be named. Returns the sprites actually added."""
+        from src.live.discover import TEAM_FROM_MOTION
+
+        banked: list[Sprite] = []
+        for discovery in discoveries:
+            if int(np.asarray(discovery.alpha).sum()) < self.min_area:
+                self.skipped.append("too small to be a usable sprite")
+                continue
+            # Facing follows team, so a shaky team read puts a back view in
+            # the library labelled as a front. Only things that *face* are
+            # held to this: a building is drawn the same way whoever owns
+            # it, so its team being a fallback read costs nothing.
+            if (self.require_motion_team
+                    and discovery.kind == CardType.TROOP
+                    and getattr(discovery, "team_source", TEAM_FROM_MOTION)
+                    != TEAM_FROM_MOTION):
+                self.skipped.append("troop team not established by motion")
+                continue
+
+            card, reason = name_discovery(discovery, self.cards, tracker, own_card)
+            if not card:
+                self.skipped.append(reason)
+                continue
+            stats = self.cards.get(card)
+            sprite = discovery.to_sprite(
+                card, kind=stats.type if stats is not None else None)
+            self.library.add(sprite)
+            banked.append(sprite)
+        return banked
