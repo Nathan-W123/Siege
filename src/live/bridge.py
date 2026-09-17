@@ -26,9 +26,10 @@ about what it cannot:
 - **Approximated:** unit HP (from health-bar fill; full bars are
   indistinguishable from occluded ones), and unit identity where the
   classifier abstains.
-- **Absent:** attack cooldowns, targeting locks, deploy timers, charge and
-  ramp state. The policy never observes these — they are not in any
-  observation tier — so leaving them at defaults costs nothing.
+- **Absent:** attack cooldowns, targeting locks, deploy timers, building
+  self-destruct timers, charge and ramp state. The policy never observes
+  these — they are not in any observation tier — so leaving them at defaults
+  costs nothing.
 
 The one thing that would be dishonest is inventing opponent elixir. It comes
 from `OpponentTracker`, which derives it from observed play, and it is only
@@ -42,9 +43,9 @@ from dataclasses import dataclass, field
 from src.agent import masking, obs_layout
 from src.agent.network import PolicyNetwork, masks_to_tensors, obs_to_tensors
 from src.simulator.cards import ArenaConfig, CardStats
-from src.simulator.constants import HAND_SIZE, PLACE_COLS, Side
+from src.simulator.constants import HAND_SIZE, PLACE_COLS, CardType, Side
 from src.simulator.engine import BattleEngine
-from src.simulator.entities import Unit
+from src.simulator.entities import PendingSpell, Unit
 
 # Perceived units carry no deploy timer, so they are back-dated far enough
 # that the engine treats them as fully active. A live detection is by
@@ -54,7 +55,19 @@ _LONG_AGO = -1000.0
 
 @dataclass
 class PerceivedUnit:
-    """One unit the vision pipeline reported."""
+    """One entity on the arena the vision pipeline reported.
+
+    `kind` is carried separately from `card` on purpose. Identity and kind
+    are *different detection problems* with very different difficulty: which
+    of eight cards a sprite is, is hard; whether it is moving or bolted to a
+    tile is easy, and a detector answers it far more often than it answers
+    the first. Keeping them apart lets the easy answer through when the hard
+    one abstains, which is exactly the case `ShadowEngine._stand_in` exists
+    to handle.
+
+    When `card` names a card in the table, that card's own type wins — the
+    table is authoritative and perception's guess at kind is not needed.
+    """
 
     card: str            # "" when the classifier abstained
     tile_x: float
@@ -62,6 +75,37 @@ class PerceivedUnit:
     hostile: bool
     hp_fraction: float = 1.0
     hp_confident: bool = False
+    kind: CardType = CardType.TROOP
+
+
+@dataclass
+class PerceivedSpell:
+    """One spell cast the frame-difference detector reported.
+
+    Spells are *events*, not entities: a fireball is a half-second of
+    expanding VFX with no health bar and nothing left behind, so the
+    health-bar segmenter that finds troops cannot see one at any threshold.
+    They arrive on their own channel for that reason (`src.live.spells`).
+
+    What is measured and what is not, kept apart deliberately:
+
+    - **Measured:** position and `radius`, straight off the VFX footprint.
+    - **Not visible at all:** damage. No number of pixels reveals it; it is
+      looked up from the card table once identity is resolved, and taken
+      from a neutral stand-in when it is not.
+
+    So an unidentified spell still reports a truthful footprint with a
+    guessed magnitude — which is the right way round, because channels 6/7
+    are dominated by *where* the area denial is.
+    """
+
+    card: str            # "" when identity could not be resolved
+    tile_x: float
+    tile_y: float
+    hostile: bool
+    radius: float = 0.0          # tiles, measured; 0 = fall back to the card
+    time_to_impact: float = 0.0  # seconds until it lands
+    confidence: float = 0.0
 
 
 @dataclass
@@ -73,6 +117,7 @@ class LiveObservation:
     own_elixir: float
     match_time: float = 0.0
     units: list[PerceivedUnit] = field(default_factory=list)
+    spells: list[PerceivedSpell] = field(default_factory=list)
     # Tower state, keyed as the engine names them.
     own_left_alive: bool = True
     own_right_alive: bool = True
@@ -92,7 +137,9 @@ class ShadowEngine:
     """
 
     def __init__(self, cards: dict[str, CardStats], arena: ArenaConfig,
-                 deck: list[str], fallback_card: str = "knight"):
+                 deck: list[str], fallback_card: str = "knight",
+                 fallback_building: str = "cannon",
+                 fallback_spell: str = "fireball"):
         missing = [c for c in deck if c not in cards]
         if missing:
             raise ValueError(f"deck cards not in the card table: {missing}")
@@ -101,10 +148,30 @@ class ShadowEngine:
         self.cards = cards
         self.arena = arena
         self.deck = list(deck)
-        # Stand-in for a detection the classifier could not name. Something
+        # Stand-ins for a detection the classifier could not name. Something
         # from the deck would be a worse lie — it would imply knowledge of
         # the opponent's cards that was never observed.
+        #
+        # One stand-in per *kind*, not one overall. See `_stand_in`: getting
+        # the kind wrong is a different and worse error than getting the card
+        # wrong, so the abstention path must at least preserve kind.
         self.fallback_card = fallback_card if fallback_card in cards else self.deck[0]
+        self.fallback_building = self._pick_stand_in(fallback_building, CardType.BUILDING)
+        self.fallback_spell = self._pick_stand_in(fallback_spell, CardType.SPELL)
+
+    def _pick_stand_in(self, preferred: str, kind: CardType) -> str | None:
+        """Name a card of `kind` to stand in for unnamed detections of it.
+
+        Falls back to any card of the right kind rather than raising: a card
+        table without, say, a cannon is a perfectly valid table, and losing
+        the stand-in would silently take the whole kind out of the
+        observation. None means the table has no card of this kind at all,
+        which `_stand_in` handles by dropping the detection.
+        """
+        entry = self.cards.get(preferred)
+        if entry is not None and entry.type == kind:
+            return preferred
+        return next((n for n, c in sorted(self.cards.items()) if c.type == kind), None)
 
     def build(self, observation: LiveObservation) -> BattleEngine:
         deck_cards = [self.cards[c] for c in self.deck]
@@ -116,6 +183,8 @@ class ShadowEngine:
         self._apply_towers(engine, observation)
         for unit in observation.units:
             self._spawn(engine, unit)
+        for spell in observation.spells:
+            self._cast(engine, spell)
         return engine
 
     # ---------------------------------------------------------------- parts
@@ -156,8 +225,36 @@ class ShadowEngine:
             # pocket the placement mask depends on.
             engine._king_of(tower.side).activated = True
 
+    def _stand_in(self, perceived: PerceivedUnit) -> CardStats | None:
+        """The card table entry to use for a detection, named or not.
+
+        Kind survives abstention even when identity does not, and that
+        asymmetry is the whole point. `obs_layout.encode_spatial` routes HP
+        by `Unit.is_building`: channels 2/3 are building HP, 0/1 are troop
+        HP. So a Cannon standing in as a Knight is not one mislabelled
+        entity — it moves that HP out of the enemy-building channel into the
+        enemy-troop channel, and tells the policy a structure bolted to a
+        tile is walking at its tower. Wrong card, right kind, costs the
+        policy some stat precision; wrong kind costs it the read.
+
+        Returns None only when the table has no card of the perceived kind,
+        in which case the caller drops the detection rather than inventing a
+        kind for it.
+        """
+        named = self.cards.get(perceived.card)
+        if named is not None:
+            return named          # the table is authoritative about kind
+        if perceived.kind == CardType.BUILDING:
+            return self.cards.get(self.fallback_building or "")
+        return self.cards.get(self.fallback_card)
+
     def _spawn(self, engine: BattleEngine, perceived: PerceivedUnit) -> None:
-        stats = self.cards.get(perceived.card) or self.cards[self.fallback_card]
+        stats = self._stand_in(perceived)
+        if stats is None or stats.type == CardType.SPELL:
+            # A spell has no unit to spawn. Reaching here means perception
+            # put a spell in `units`; drop it rather than materialising a
+            # zero-HP troop that would sit on the arena forever.
+            return
         side = Side.TOP if perceived.hostile else Side.BOTTOM
         hp = max(1.0, stats.hp * max(0.0, min(perceived.hp_fraction, 1.0)))
         unit = Unit(
@@ -170,6 +267,34 @@ class ShadowEngine:
         )
         engine.units.append(unit)
         engine._by_id[unit.id] = unit
+
+    def _cast(self, engine: BattleEngine, perceived: PerceivedSpell) -> None:
+        """Put a perceived spell into the engine's pending list.
+
+        The shadow engine is never stepped — it is built to be *read* by
+        `encode_obs` and `build_action_masks` — so a pending spell here is
+        purely an observation carrier and never applies damage. `resolve_at`
+        is still set honestly from the measured time to impact, so that
+        stepping one (in a test, or a future rollout) does the right thing.
+        """
+        stats = self.cards.get(perceived.card) or self.cards.get(self.fallback_spell or "")
+        if stats is None or stats.type != CardType.SPELL:
+            return
+        # Radius is the one spell property that is genuinely visible, so a
+        # measurement beats the table; damage is never visible, so the table
+        # (or the stand-in) is all there is. Mixing the two is not sloppiness
+        # — it is using each source where it is actually informed.
+        radius = perceived.radius if perceived.radius > 0 else stats.spell_radius
+        engine.spells.append(PendingSpell(
+            side=Side.TOP if perceived.hostile else Side.BOTTOM,
+            x=min(max(perceived.tile_x, 0.0), engine.arena.width - 0.01),
+            y=min(max(perceived.tile_y, 0.0), engine.arena.height - 0.01),
+            radius=radius,
+            damage=stats.spell_damage,
+            tower_multiplier=stats.tower_multiplier,
+            resolve_at=engine.time + max(0.0, perceived.time_to_impact),
+            card_name=perceived.card or stats.name,
+        ))
 
 
 @dataclass(frozen=True)

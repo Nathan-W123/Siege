@@ -15,12 +15,13 @@ from src.agent import masking, obs_layout
 from src.agent.network import make_network
 from src.live.bridge import (
     LiveObservation,
+    PerceivedSpell,
     PerceivedUnit,
     PolicyDriver,
     ShadowEngine,
     check_tier,
 )
-from src.simulator.constants import HAND_SIZE, Side
+from src.simulator.constants import HAND_SIZE, CardType, Side
 
 DECK = ["knight", "archers", "goblins", "giant",
         "musketeer", "minions", "fireball", "cannon"]
@@ -89,6 +90,130 @@ def test_unidentified_detections_still_appear(shadow):
         PerceivedUnit(card="", tile_x=9.0, tile_y=20.0, hostile=True)]))
     assert len(engine.units) == 1
     assert engine.units[0].side == Side.TOP
+
+
+# ------------------------------------------------- kind survives abstention
+
+
+def _channels(shadow, observation):
+    """Spatial channels that carry anything, by index. See `obs_layout`:
+    0/1 troop HP, 2/3 building HP, 4/5 tower HP, 6/7 spell damage, 8/9
+    presence — friendly first in each pair."""
+    grid = obs_layout.encode_spatial(shadow.build(observation), Side.BOTTOM)
+    return {i for i in range(grid.shape[0]) if grid[i].any()}
+
+
+def test_an_unnamed_building_lands_in_the_building_channel(shadow):
+    """The error this whole split exists to prevent.
+
+    `encode_spatial` routes HP by `Unit.is_building`. An unnamed Cannon
+    standing in as a Knight does not merely mislabel one entity — it moves
+    that HP out of channel 3 and into channel 1, telling the policy a
+    structure bolted to a tile is walking at its tower.
+    """
+    building = _obs(units=[PerceivedUnit(card="", tile_x=9.0, tile_y=20.0,
+                                         hostile=True, kind=CardType.BUILDING)])
+
+    assert 3 in _channels(shadow, building)     # enemy building HP
+    assert 1 not in _channels(shadow, building)  # and NOT enemy troop HP
+
+
+def test_an_unnamed_troop_still_lands_in_the_troop_channel(shadow):
+    troop = _obs(units=[PerceivedUnit(card="", tile_x=9.0, tile_y=20.0, hostile=True)])
+
+    assert 1 in _channels(shadow, troop)
+    assert 3 not in _channels(shadow, troop)
+
+
+def test_a_named_card_overrides_a_wrong_perceived_kind(shadow):
+    """The card table is authoritative. If the classifier named the card,
+    a disagreeing kind from the detector is the thing to discard."""
+    engine = shadow.build(_obs(units=[
+        PerceivedUnit(card="cannon", tile_x=9.0, tile_y=20.0, hostile=True,
+                      kind=CardType.TROOP)]))
+
+    assert engine.units[0].is_building
+
+
+def test_a_spell_in_the_unit_list_is_dropped(shadow):
+    """Perception mis-routing a spell must not materialise a troop that then
+    sits on the arena forever."""
+    engine = shadow.build(_obs(units=[
+        PerceivedUnit(card="fireball", tile_x=9.0, tile_y=20.0, hostile=True)]))
+
+    assert engine.units == []
+
+
+def test_stand_ins_survive_a_card_table_without_the_preferred_name(cards, arena):
+    """A table with no cannon is still a valid table; losing the stand-in
+    would silently drop every unnamed building from the observation."""
+    shadow = ShadowEngine(cards, arena, DECK, fallback_building="not_a_card",
+                          fallback_spell="also_not_a_card")
+
+    assert cards[shadow.fallback_building].type == CardType.BUILDING
+    assert cards[shadow.fallback_spell].type == CardType.SPELL
+
+
+# ------------------------------------------------------------------ spells
+
+
+def test_a_perceived_spell_reaches_the_spell_channel(shadow):
+    """Channels 6/7 were unreachable before: `LiveObservation` had no way to
+    express a spell, so a policy trained with them read zeros every frame."""
+    observation = _obs(spells=[PerceivedSpell(card="fireball", tile_x=9.0,
+                                              tile_y=8.0, hostile=True, radius=2.5)])
+
+    assert 7 in _channels(shadow, observation)   # enemy pending spell damage
+
+
+def test_own_spells_land_on_the_friendly_channel(shadow):
+    observation = _obs(spells=[PerceivedSpell(card="fireball", tile_x=9.0,
+                                              tile_y=24.0, hostile=False, radius=2.5)])
+
+    assert 6 in _channels(shadow, observation)
+    assert 7 not in _channels(shadow, observation)
+
+
+def test_an_unidentified_spell_keeps_its_measured_footprint(shadow, cards):
+    """Radius is measured off the VFX and damage never is, so the stand-in
+    supplies magnitude while the measurement supplies extent."""
+    engine = shadow.build(_obs(spells=[
+        PerceivedSpell(card="", tile_x=9.0, tile_y=8.0, hostile=True, radius=4.5)]))
+
+    assert len(engine.spells) == 1
+    assert engine.spells[0].radius == pytest.approx(4.5)
+    assert engine.spells[0].damage == cards[shadow.fallback_spell].spell_damage
+
+
+def test_a_spell_with_no_measured_radius_falls_back_to_the_card(shadow, cards):
+    engine = shadow.build(_obs(spells=[
+        PerceivedSpell(card="fireball", tile_x=9.0, tile_y=8.0, hostile=True)]))
+
+    assert engine.spells[0].radius == pytest.approx(cards["fireball"].spell_radius)
+
+
+def test_a_troop_named_as_a_spell_is_dropped(shadow):
+    """The mirror of the drop above, and it drops rather than substituting.
+
+    A named troop arriving in the spell list means perception is confused
+    about this detection, not that a spell landed. Standing a fireball in
+    for it would deny an area nothing is threatening — worse than silence,
+    because the policy would dodge a spell that was never cast.
+    """
+    engine = shadow.build(_obs(spells=[
+        PerceivedSpell(card="knight", tile_x=9.0, tile_y=8.0, hostile=True)]))
+
+    assert engine.spells == []
+
+
+def test_spells_do_not_accumulate_across_frames(shadow):
+    """Same rebuild-per-frame guarantee the unit list has. A spell carried
+    forward would deny its area for the rest of the match."""
+    observation = _obs(spells=[PerceivedSpell(card="fireball", tile_x=9.0,
+                                              tile_y=8.0, hostile=True)])
+    shadow.build(observation)
+
+    assert len(shadow.build(observation).spells) == 1
 
 
 def test_fallen_towers_are_reflected_and_activate_the_king(shadow):

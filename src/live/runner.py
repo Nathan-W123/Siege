@@ -7,6 +7,7 @@ from typing import Callable
 
 from src.live.config import LiveConfig, Rect
 from src.live.device import LiveDevice
+from src.live.spells import SpellConfig, SpellWatcher
 from src.live.vision import mean_luma, mean_saturation
 
 
@@ -71,6 +72,9 @@ class LiveMatchRunner:
         self.homography = config.homography()
         # A `PolicyDriver` (src/live/bridge.py) when running a checkpoint.
         self.driver = driver
+        # Spells are detected across frames, not within one, so the watcher
+        # is long-lived state on the runner rather than a per-frame call.
+        self.spell_watcher = SpellWatcher(self.homography, config=SpellConfig())
         self._match_started_at = 0.0
         self._degraded = False
 
@@ -85,7 +89,7 @@ class LiveMatchRunner:
         downstream is invented, and the policy would confidently play cards
         that are not available.
         """
-        from src.live.bridge import LiveObservation, PerceivedUnit
+        from src.live.bridge import LiveObservation, PerceivedSpell, PerceivedUnit
         from src.live.vision import TEAM_HOSTILE, detect_units, read_elixir
 
         config = self.config
@@ -115,7 +119,49 @@ class LiveMatchRunner:
             own_elixir=elixir,
             match_time=max(0.0, time.monotonic() - self._match_started_at),
             units=units,
+            spells=self._perceive_spells(image, homography),
         )
+
+    def _perceive_spells(self, image, homography) -> list:
+        """Spell casts that finished expanding on this frame, if any.
+
+        Runs on every frame and returns nothing on nearly all of them: the
+        watcher needs the frames in between to see a bloom at all, so it
+        cannot be called only when something looks interesting.
+
+        Identity is resolved against the full spell roster here, which means
+        it usually abstains — several spells share a footprint, and radius
+        alone cannot separate them. That is the honest answer until a
+        deterministic `OpponentTracker` is threaded through to supply
+        `candidates` and `elixir_drop`; with those the same call names most
+        casts, and it needs no labelled data to do it. An abstaining spell
+        still carries a measured footprint, which is most of what channels
+        6/7 encode.
+        """
+        from src.live.bridge import PerceivedSpell
+        from src.live.spells import resolve_identity
+        from src.simulator.cards import load_arena, load_cards
+
+        self.spell_watcher.arena = load_arena()
+        try:
+            events = self.spell_watcher.observe(
+                image, now=time.monotonic(), homography=homography)
+        except ValueError:
+            return []
+
+        cards = load_cards()
+        return [PerceivedSpell(
+            card=resolve_identity(event, cards),
+            tile_x=event.tile_x, tile_y=event.tile_y,
+            # Perception cannot tell whose spell it is from the VFX — spells
+            # are not team-tinted the way health bars are. Assuming hostile
+            # is the safe default: a spell of ours read as theirs costs the
+            # policy some caution, while one of theirs read as ours would
+            # have it ignore an area that is about to be cleared.
+            hostile=True,
+            radius=event.radius,
+            confidence=event.confidence,
+        ) for event in events]
 
     def tile_to_pixel(self, tile: tuple[float, float],
                       image_size: tuple[int, int]) -> tuple[int, int] | None:
@@ -172,6 +218,9 @@ class LiveMatchRunner:
             self._last_logged_choice = None
             self._match_started_at = time.monotonic()
             self._degraded = False
+            # A track carried across a match boundary would emit its spell
+            # against the new board, at a tile that means nothing there.
+            self.spell_watcher.reset()
             self.log("Match detected; hand cycle reset.")
         self._was_in_match = in_match
         if not in_match or time.monotonic() - self._last_action_at < self.config.action_cooldown_seconds:

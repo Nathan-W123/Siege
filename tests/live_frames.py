@@ -132,3 +132,110 @@ if __name__ == "__main__":  # pragma: no cover - fixture regeneration
     from src.simulator.cards import load_arena
 
     print(write_default_fixture(load_arena()))
+
+
+# ------------------------------------------------------------ spell frames
+
+SPELL_RGB = (255, 196, 64)         # bright VFX bloom; nothing in the arena
+                                   # palette is this bright or this warm
+# Frame-to-frame brightness modulation of the bloom. Real spell VFX animates
+# internally -- particles, a swirling core, a pulsing rim -- so consecutive
+# frames differ across the *whole* footprint. A flat disc would differ only
+# on the ring it grew by, which understates the footprint by the square of
+# the growth rate and would let a detector pass these tests while measuring
+# something much smaller than a real spell presents.
+SPELL_PULSE = (1.0, 0.8)
+
+
+def _draw_disc(frame: np.ndarray, cx: float, cy: float, radius: float, rgb) -> None:
+    """Filled disc. Spell VFX is round; drawing it as a rectangle would let
+    a detector pass the area tests without ever facing a real footprint."""
+    h_img, w_img = frame.shape[:2]
+    if radius <= 0:
+        return
+    y0, y1 = max(0, int(cy - radius)), min(h_img, int(cy + radius) + 1)
+    x0, x1 = max(0, int(cx - radius)), min(w_img, int(cx + radius) + 1)
+    if y1 <= y0 or x1 <= x0:
+        return
+    ys = np.arange(y0, y1)[:, None]
+    xs = np.arange(x0, x1)[None, :]
+    inside = (ys - cy) ** 2 + (xs - cx) ** 2 <= radius ** 2
+    frame[y0:y1, x0:x1][inside] = rgb
+
+
+def bloom_radii(peak: float, grow_frames: int, fade_frames: int) -> list[float]:
+    """Radius per frame: a bloom that grows, peaks, then collapses.
+
+    Starts and ends at zero so a detector sees a real onset and a real
+    disappearance rather than beginning mid-bloom.
+    """
+    return ([0.0]
+            + [peak * (i + 1) / grow_frames for i in range(grow_frames)]
+            + [peak * (fade_frames - i) / (fade_frames + 1) for i in range(fade_frames)]
+            + [0.0])
+
+
+def render_bloom_at_pixel(
+    arena,
+    center_px: tuple[float, float],
+    peak_radius_px: float = 34.0,
+    grow_frames: int = 4,
+    fade_frames: int = 3,
+    size=FRAME_SIZE,
+    units: list[PlannedUnit] | None = None,
+):
+    """Frames of a spell bloom centred on a screen pixel.
+
+    Takes a pixel rather than a tile so the same helper renders a bloom on
+    the board and one over the HUD, which is the difference the arena bound
+    is supposed to catch.
+    """
+    cx, cy = center_px
+    frames = []
+    meta = None
+    for i, radius in enumerate(bloom_radii(peak_radius_px, grow_frames, fade_frames)):
+        image, meta = render_frame(arena, units or [], size=size)
+        frame = np.array(image)
+        pulse = SPELL_PULSE[i % len(SPELL_PULSE)]
+        _draw_disc(frame, cx, cy, radius,
+                   tuple(int(c * pulse) for c in SPELL_RGB))
+        frames.append(Image.fromarray(frame))
+    return frames, meta
+
+
+def render_spell_sequence(
+    arena,
+    tile: tuple[float, float],
+    peak_radius_px: float = 34.0,
+    grow_frames: int = 4,
+    fade_frames: int = 3,
+    size=FRAME_SIZE,
+    units: list[PlannedUnit] | None = None,
+):
+    """A spell bloom centred on an arena tile."""
+    project = perspective_camera(arena, size)
+    return render_bloom_at_pixel(
+        arena, project(*tile), peak_radius_px=peak_radius_px,
+        grow_frames=grow_frames, fade_frames=fade_frames, size=size, units=units)
+
+
+def render_march_sequence(
+    arena,
+    start_tile: tuple[float, float],
+    steps: int = 8,
+    dy: float = -0.6,
+    size=FRAME_SIZE,
+):
+    """A hostile unit walking down the board, frame by frame.
+
+    The negative case the spell detector has to survive: this produces
+    change on every frame, at a real position, for longer than any spell
+    lasts. Anything that fires on it would fire on every push.
+    """
+    frames = []
+    meta = None
+    for i in range(steps):
+        tile = (start_tile[0], start_tile[1] + dy * i)
+        image, meta = render_frame(arena, [PlannedUnit("hostile", tile, 1.0)], size=size)
+        frames.append(image)
+    return frames, meta
