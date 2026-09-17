@@ -41,7 +41,8 @@ that are already on screen. See CLAUDE.md, "On-Screen Visual Perception".
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
@@ -87,6 +88,13 @@ class SpellConfig:
     # Ratio of peak area to the area at first sight. A spell grows; a
     # persistent object that merely got brighter does not.
     min_growth: float = 1.35
+    # Captures farther apart than this cannot resolve a bloom at all. A
+    # spell grows, peaks and collapses in well under a second, so a sampler
+    # managing two frames in that window sees one flash with no growth to
+    # measure. The watcher reports `starved` when it is fed this slowly,
+    # because the symptom otherwise is that no spell is ever detected --
+    # which looks exactly like a match where nobody cast one.
+    max_frame_interval: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -150,12 +158,34 @@ class SpellWatcher:
         self.arena = arena
         self._prev: np.ndarray | None = None
         self._tracks: list[_Track] = []
+        self._intervals: deque = deque(maxlen=20)
+        self._last_now: float | None = None
 
     def reset(self) -> None:
         """Drop all state. Call between matches — a track carried across a
         match boundary would emit against the new board."""
         self._prev = None
         self._tracks = []
+        # The measured capture rate is a property of the polling loop, not
+        # of the match, so it survives — but the boundary gap itself must
+        # not be counted as an interval.
+        self._last_now = None
+
+    @property
+    def frame_interval(self) -> float:
+        """Median seconds between recent captures; 0.0 before two arrive."""
+        return float(np.median(self._intervals)) if self._intervals else 0.0
+
+    @property
+    def starved(self) -> bool:
+        """True when captures arrive too far apart to resolve a bloom.
+
+        Callers should surface this. Being fed slowly does not degrade
+        detection gracefully — it stops it — and the resulting silence is
+        indistinguishable from a quiet match.
+        """
+        return (len(self._intervals) >= 5
+                and self.frame_interval > self.config.max_frame_interval)
 
     # ------------------------------------------------------------- stepping
 
@@ -174,6 +204,9 @@ class SpellWatcher:
         cfg = self.config
         if homography is not None:
             self.homography = homography
+        if self._last_now is not None and now > self._last_now:
+            self._intervals.append(now - self._last_now)
+        self._last_now = now
         array = np.asarray(image)
         if array.ndim != 3 or array.shape[2] < 3:
             return []

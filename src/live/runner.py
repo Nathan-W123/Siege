@@ -75,6 +75,10 @@ class LiveMatchRunner:
         # Spells are detected across frames, not within one, so the watcher
         # is long-lived state on the runner rather than a per-frame call.
         self.spell_watcher = SpellWatcher(self.homography, config=SpellConfig())
+        # Events accumulate between decisions, because the watcher is fed on
+        # every capture but drained only when a decision is made.
+        self._spell_events: list = []
+        self._warned_capture_rate = False
         self._match_started_at = 0.0
         self._degraded = False
 
@@ -119,18 +123,48 @@ class LiveMatchRunner:
             own_elixir=elixir,
             match_time=max(0.0, time.monotonic() - self._match_started_at),
             units=units,
-            spells=self._perceive_spells(image, homography),
+            spells=self._drain_spells(),
         )
 
-    def _perceive_spells(self, image, homography) -> list:
-        """Spell casts that finished expanding on this frame, if any.
+    def _observe_spells(self, image) -> None:
+        """Feed one capture to the spell watcher and buffer what it emits.
 
-        Runs on every frame and returns nothing on nearly all of them: the
-        watcher needs the frames in between to see a bloom at all, so it
-        cannot be called only when something looks interesting.
+        Separate from `perceive` because the two run on different clocks.
+        Perception runs when a decision is due; the watcher needs *every*
+        frame, since a bloom is only visible as a difference between
+        consecutive ones.
 
-        Identity is resolved against the full spell roster here, which means
-        it usually abstains — several spells share a footprint, and radius
+        A capture rate too slow to resolve a bloom does not degrade
+        detection gracefully, it stops it, so the watcher is asked whether
+        it is starved and the answer is logged once rather than left to look
+        like a quiet match.
+        """
+        if self.homography is None:
+            return
+        from src.simulator.cards import load_arena
+
+        self.spell_watcher.arena = load_arena()
+        try:
+            homography = self.homography.scaled_to(
+                self.config.reference_size, image.size)
+            self._spell_events.extend(self.spell_watcher.observe(
+                image, now=time.monotonic(), homography=homography))
+        except ValueError:
+            return
+
+        if self.spell_watcher.starved and not self._warned_capture_rate:
+            self._warned_capture_rate = True
+            self.log(
+                f"Captures are {self.spell_watcher.frame_interval:.2f}s apart; "
+                f"spell detection needs "
+                f"{self.spell_watcher.config.max_frame_interval:.2f}s or less. "
+                "Lower `poll_seconds`, or expect no spells to be reported.")
+
+    def _drain_spells(self) -> list:
+        """Spell casts buffered since the last decision.
+
+        Identity is resolved against the full spell roster, which means it
+        usually abstains — several spells share a footprint, and radius
         alone cannot separate them. That is the honest answer until a
         deterministic `OpponentTracker` is threaded through to supply
         `candidates` and `elixir_drop`; with those the same call names most
@@ -140,13 +174,10 @@ class LiveMatchRunner:
         """
         from src.live.bridge import PerceivedSpell
         from src.live.spells import resolve_identity
-        from src.simulator.cards import load_arena, load_cards
+        from src.simulator.cards import load_cards
 
-        self.spell_watcher.arena = load_arena()
-        try:
-            events = self.spell_watcher.observe(
-                image, now=time.monotonic(), homography=homography)
-        except ValueError:
+        events, self._spell_events = self._spell_events, []
+        if not events:
             return []
 
         cards = load_cards()
@@ -221,8 +252,17 @@ class LiveMatchRunner:
             # A track carried across a match boundary would emit its spell
             # against the new board, at a tile that means nothing there.
             self.spell_watcher.reset()
+            self._spell_events = []
             self.log("Match detected; hand cycle reset.")
         self._was_in_match = in_match
+
+        # Feed the spell watcher here, deliberately ahead of the cooldown
+        # return below. A spell blooms and collapses in well under a second
+        # while `action_cooldown_seconds` defaults to 1.2, so sampling only
+        # the frames we act on would miss every cast in the match.
+        if in_match:
+            self._observe_spells(image)
+
         if not in_match or time.monotonic() - self._last_action_at < self.config.action_cooldown_seconds:
             return
 

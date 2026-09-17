@@ -238,3 +238,60 @@ def test_unknown_footprint_abstains(cards):
                        at=1.0, peak_area=200, growth=2.0, confidence=0.8)
 
     assert resolve_identity(event, cards) == ""
+
+
+# ---------------------------------------------------------- capture rate
+
+
+def test_a_slow_capture_rate_is_reported_not_silent(arena):
+    """Being fed slowly does not degrade detection, it stops it.
+
+    A bloom lasts well under a second, so a sampler managing two frames in
+    that window sees one flash with no growth to measure. The resulting
+    silence is indistinguishable from a match where nobody cast anything,
+    which is exactly the kind of failure this project keeps insisting be
+    made visible.
+    """
+    frames, meta = render_spell_sequence(arena, (9.0, 20.0))
+    watcher = SpellWatcher(_homography(arena, meta), arena)
+
+    for i in range(8):
+        watcher.observe(frames[i % len(frames)], now=i * 1.2)   # the default cooldown
+
+    assert watcher.starved
+    assert watcher.frame_interval == pytest.approx(1.2, abs=0.01)
+
+
+def test_a_healthy_capture_rate_is_not_flagged(arena):
+    frames, meta = render_spell_sequence(arena, (9.0, 20.0))
+    watcher = SpellWatcher(_homography(arena, meta), arena)
+
+    for i, frame in enumerate(frames):
+        watcher.observe(frame, now=i * 0.05)
+
+    assert not watcher.starved
+
+
+def test_starvation_needs_a_few_frames_before_it_is_claimed(arena):
+    """One slow frame is a hiccup, not a capture rate."""
+    frames, meta = render_spell_sequence(arena, (9.0, 20.0))
+    watcher = SpellWatcher(_homography(arena, meta), arena)
+
+    watcher.observe(frames[0], now=0.0)
+    watcher.observe(frames[1], now=2.0)
+
+    assert not watcher.starved
+
+
+def test_a_match_boundary_gap_is_not_counted_as_the_rate(arena):
+    """`reset` happens between matches, and the wait for the next one would
+    otherwise read as a permanently starved capture loop."""
+    frames, meta = render_spell_sequence(arena, (9.0, 20.0))
+    watcher = SpellWatcher(_homography(arena, meta), arena)
+    for i, frame in enumerate(frames):
+        watcher.observe(frame, now=i * 0.05)
+
+    watcher.reset()
+    watcher.observe(frames[0], now=600.0)          # ten minutes between matches
+
+    assert watcher.frame_interval == pytest.approx(0.05, abs=0.01)

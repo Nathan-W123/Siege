@@ -7,6 +7,8 @@ came from.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 import torch
@@ -420,6 +422,99 @@ def test_runner_falls_back_when_perception_fails(tmp_path, arena, cards):
     runner._was_in_match = True
     assert runner._step_policy(blank) is False
     assert any("falling back" in m for m in messages)
+
+
+def _driven_clock(monkeypatch, step_seconds=0.05):
+    """A monotonic clock the test advances, one tick per `step`.
+
+    Real `time.monotonic` makes these tests unrunnable: the loop feeds a
+    whole bloom in microseconds, and the watcher correctly refuses to call
+    anything that brief a spell. Driving the clock tests the wiring at the
+    frame rate a capture loop actually produces.
+    """
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def tick():
+        now[0] += step_seconds
+
+    return now, tick
+
+
+def test_spells_are_watched_even_while_the_cooldown_blocks_acting(
+        tmp_path, arena, cards, monkeypatch):
+    """The bug this guards: `step` returns on `action_cooldown_seconds`
+    (1.2s by default) before perception runs, while a spell blooms and
+    collapses in well under a second. Feeding the watcher only on the frames
+    we act on would miss every cast in the match, and do it silently.
+    """
+    from src.live.runner import LiveMatchRunner
+    from tests.live_frames import render_spell_sequence
+
+    config = _policy_config(tmp_path, arena)
+    frames, _ = render_spell_sequence(arena, (9.0, 20.0))
+    device = _FakeDevice(frames[0])
+    _, tick = _driven_clock(monkeypatch)
+    runner = LiveMatchRunner(config, device, armed=False, log=lambda _: None)
+    runner._was_in_match = True
+    # Block acting for the whole sequence, the way a real cooldown does.
+    runner._last_action_at = 1e9
+
+    for frame in frames:
+        device.image = frame
+        runner.step()
+        tick()
+
+    assert runner._spell_events, "no cast was observed across the cooldown"
+
+
+def test_a_decision_drains_the_buffered_casts(tmp_path, arena, cards, monkeypatch):
+    """Buffered events have to reach the observation, and reach it once."""
+    from src.live.runner import LiveMatchRunner
+    from tests.live_frames import render_spell_sequence
+
+    config = _policy_config(tmp_path, arena)
+    frames, _ = render_spell_sequence(arena, (9.0, 20.0))
+    device = _FakeDevice(frames[0])
+    _, tick = _driven_clock(monkeypatch)
+    runner = LiveMatchRunner(config, device, armed=False, log=lambda _: None)
+    runner._was_in_match = True
+    runner._last_action_at = 1e9
+    for frame in frames:
+        device.image = frame
+        runner.step()
+        tick()
+    assert runner._spell_events
+
+    observation = runner.perceive(frames[-1])
+
+    assert observation is not None and observation.spells
+    assert runner._spell_events == [], "a drained cast must not be reported twice"
+    assert runner.perceive(frames[-1]).spells == []
+
+
+def test_a_starved_capture_rate_is_logged_once(tmp_path, arena, cards, monkeypatch):
+    """Silence from the spell detector must be explained, not inferred."""
+    from PIL import Image
+
+    from src.live.runner import LiveMatchRunner
+
+    config = _policy_config(tmp_path, arena)
+    blank = Image.new("RGB", (556, 1028), (96, 128, 84))
+    messages = []
+    _, tick = _driven_clock(monkeypatch, step_seconds=1.5)
+    runner = LiveMatchRunner(config, _FakeDevice(blank), armed=False,
+                             log=messages.append)
+    runner._was_in_match = True
+    runner._last_action_at = 1e9
+
+    for _ in range(10):
+        runner.step()
+        tick()
+
+    warnings = [m for m in messages if "Captures are" in m]
+    assert len(warnings) == 1, "the warning must fire once, not every frame"
+    assert "poll_seconds" in warnings[0]
 
 
 def test_runner_taps_slot_then_tile_when_armed(tmp_path, arena, cards):
