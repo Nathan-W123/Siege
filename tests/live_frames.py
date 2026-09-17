@@ -239,3 +239,44 @@ def render_march_sequence(
         image, meta = render_frame(arena, [PlannedUnit("hostile", tile, 1.0)], size=size)
         frames.append(image)
     return frames, meta
+
+
+# ------------------------------------------------------- units with bodies
+
+BODY_RGB = (170, 140, 110)         # desaturated, so it sits OUTSIDE both team
+                                   # hue windows -- a recolour that touched it
+                                   # would show up as a failure, not as noise
+BODY_RADIUS = 11
+
+
+def render_unit_with_body(
+    arena,
+    tile: tuple[float, float],
+    team: str = "hostile",
+    hp_fraction: float = 1.0,
+    size=FRAME_SIZE,
+    bar_to_feet_px: int = 14,
+    with_hud_distractor: bool = True,
+):
+    """A unit drawn as a body plus its health bar.
+
+    `render_frame` draws bars alone, which is all the blob detector needs.
+    Harvesting needs something bar-shaped *and* something body-shaped: the
+    bar is what gets retinted between teams and the body is what must
+    survive that retint untouched.
+    """
+    project = perspective_camera(arena, size)
+    image, meta = render_frame(arena, [PlannedUnit(team, tile, hp_fraction)],
+                               size=size, bar_to_feet_px=bar_to_feet_px,
+                               with_hud_distractor=with_hud_distractor)
+    feet_x, feet_y = project(*tile)
+    frame = np.array(image)
+    _draw_disc(frame, feet_x, feet_y - BODY_RADIUS, BODY_RADIUS, BODY_RGB)
+    return Image.fromarray(frame), meta
+
+
+def render_empty(arena, size=FRAME_SIZE, with_hud_distractor: bool = True):
+    """An empty arena frame — the plate `harvest` subtracts against."""
+    image, meta = render_frame(arena, [], size=size,
+                               with_hud_distractor=with_hud_distractor)
+    return image, meta
