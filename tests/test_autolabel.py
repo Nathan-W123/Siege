@@ -275,5 +275,5 @@ def test_banked_frames_load_through_the_training_dataset(cards, frame, tmp_path)
     image, targets, annotations, size = dataset[0]
 
     assert image.shape == (3, 64, 64)
-    assert targets["heatmap"].shape[0] == 1
+    assert targets["heatmap"].shape[0] == 2   # one card plus the unnamed channel
     assert annotations[0]["card"] == "cannon"

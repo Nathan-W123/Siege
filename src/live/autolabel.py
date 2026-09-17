@@ -294,7 +294,14 @@ class SelfLabeler:
             # these. Reporting 1.0 would claim a measurement that was never
             # made, so banked examples carry 0.0 and consumers that filter on
             # visibility should treat real frames separately.
-            visibility=0.0)
+            visibility=0.0,
+            # Real frames are the one source with the facing right. A
+            # composited enemy is a retinted friendly sprite showing its
+            # back, so `synth` withholds identity supervision from it; this
+            # is an actual enemy, drawn facing the camera, named by the
+            # tracker. It is precisely the example the synthetic set cannot
+            # produce, and the reason this loop exists.
+            identity_supervised=True)
 
 
 class LabelStore:

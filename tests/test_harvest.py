@@ -216,3 +216,46 @@ def test_library_round_trips_through_disk(arena, plate, tmp_path):
 
 def test_library_load_of_an_empty_directory_is_empty(tmp_path):
     assert len(SpriteLibrary.load(tmp_path)) == 0
+
+
+# ------------------------------------------------------------------ facing
+
+
+def test_facing_follows_the_team_it_was_harvested_from(arena, plate):
+    """You play from the bottom, so your troops walk up and show their backs
+    while the opponent's walk down and show their fronts. Which one a sprite
+    is decides what it may be used to teach."""
+    from src.live.harvest import FACING_AWAY, FACING_TOWARD
+
+    frame, _ = render_unit_with_body(arena, (9.0, 20.0))
+
+    ours = harvest(frame, plate, "knight", team=TEAM_FRIENDLY, config=CONFIG)[0]
+    theirs = harvest(frame, plate, "knight", team=TEAM_HOSTILE, config=CONFIG)[0]
+
+    assert ours.facing == FACING_AWAY
+    assert theirs.facing == FACING_TOWARD
+
+
+def test_facing_can_be_stated_outright(arena, plate):
+    """A sprite banked from a real enemy on our own half is facing toward us
+    whatever team bookkeeping says."""
+    from src.live.harvest import FACING_TOWARD
+
+    frame, _ = render_unit_with_body(arena, (9.0, 20.0))
+
+    sprite = harvest(frame, plate, "knight", team=TEAM_FRIENDLY,
+                     facing=FACING_TOWARD, config=CONFIG)[0]
+
+    assert sprite.facing == FACING_TOWARD
+
+
+def test_facing_survives_the_round_trip(arena, plate, tmp_path):
+    """Losing it on reload would silently re-enable the wrong supervision."""
+    from src.live.harvest import FACING_TOWARD
+
+    frame, _ = render_unit_with_body(arena, (9.0, 20.0))
+    library = SpriteLibrary()
+    library.extend(harvest(frame, plate, "knight", facing=FACING_TOWARD, config=CONFIG))
+    library.save(tmp_path)
+
+    assert SpriteLibrary.load(tmp_path).get("knight")[0].facing == FACING_TOWARD

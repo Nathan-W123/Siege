@@ -20,6 +20,33 @@ wrong. The only geometric transform between "where this sprite was
 harvested" and "where it is being pasted" is the perspective scale, and the
 homography already knows it exactly.
 
+The facing problem, and what it costs
+-------------------------------------
+You play from the bottom of the screen. Your troops walk *up* the board, so
+you see their backs; the opponent's walk down, so you see their fronts. A
+harvest from your own deploys therefore collects exactly one of the two
+appearances the detector will meet, and nothing recovers the other: a
+horizontal flip mirrors a back into a back, and the game draws the two
+facings as separate art rather than as one sprite rotated.
+
+`recolor_team` can still make a hostile example out of a friendly sprite,
+because the bar tint is genuinely all that team changes about the *pixels*.
+What it cannot do is make it a truthful example of **which card** an enemy
+sprite is, since a real enemy of that card shows a face where this shows a
+back.
+
+So a team-swapped sprite is composed and labelled, but marked
+`identity_supervised=False`. Downstream that means it teaches the detector
+where an enemy is, how big it is, which team it belongs to and whether it is
+a building — all of which transfer across facing — and teaches it nothing
+about which card it is. Training it on the card name here would actively
+teach the wrong appearance, which is worse than teaching nothing.
+
+Enemy *identity* comes from real frames instead, via `autolabel.py`. That
+loop needs the detector to find the box, not to name it — the name comes
+from the cycle tracker's deduction — so a bootstrap that localizes enemies
+without naming them is exactly enough to start it.
+
 Where this is weakest, stated plainly
 -------------------------------------
 Composited scenes get the *appearance* of occlusion right and the
@@ -40,7 +67,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from src.live.harvest import Sprite, SpriteLibrary
+from src.live.harvest import Sprite, SpriteLibrary, facing_of
 from src.live.vision import DEFAULT_TEAM_COLORS, TEAM_FRIENDLY, TEAM_HOSTILE, rgb_to_hsv
 
 
@@ -93,6 +120,12 @@ class Annotation:
     tile_x: float
     tile_y: float
     visibility: float
+    # False when this example's sprite is facing the wrong way for the team
+    # it is labelled with — a friendly harvest retinted into an enemy. The
+    # box, team and kind are still true; the card name is not something this
+    # pixel arrangement should be taught to predict. See the module
+    # docstring, "The facing problem".
+    identity_supervised: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -125,10 +158,15 @@ def hsv_to_rgb(hue: np.ndarray, sat: np.ndarray, val: np.ndarray) -> np.ndarray:
 def recolor_team(sprite: Sprite, to_team: str, teams=DEFAULT_TEAM_COLORS) -> Sprite:
     """Retint a sprite's health bar to the other team.
 
-    This is what makes harvesting from your own deploys sufficient. A card's
-    body pixels are identical whoever played it — only the bar above it is
-    team-tinted — so one harvest pass over your own deck yields hostile
-    training examples too, and the opponent never has to cooperate.
+    A card's body pixels are identical whoever played it — only the bar
+    above it is team-tinted — so one harvest pass over your own deck yields
+    hostile examples too, and the opponent never has to cooperate.
+
+    What this does *not* do is change which way the sprite faces, and it
+    cannot: your units show their backs and the opponent's show their
+    fronts, and those are different art. The returned sprite keeps its
+    original `facing` for exactly that reason, and `compose_scene` reads it
+    to decide whether the example may supervise card identity.
 
     Only pixels inside the source team's hue window are touched, and only
     their hue: saturation and value carry the bar's fill state and its
@@ -155,7 +193,8 @@ def recolor_team(sprite: Sprite, to_team: str, teams=DEFAULT_TEAM_COLORS) -> Spr
                    (hsv_to_rgb(hue, sat, val) * 255.0).astype(np.uint8),
                    sprite.rgb)
     return Sprite(card=sprite.card, kind=sprite.kind, team=to_team,
-                  rgb=rgb, alpha=sprite.alpha, tile=sprite.tile)
+                  rgb=rgb, alpha=sprite.alpha, tile=sprite.tile,
+                  facing=sprite.facing)
 
 
 # ---------------------------------------------------------------- geometry
@@ -197,7 +236,8 @@ def resize_sprite(sprite: Sprite, scale: float) -> Sprite:
     alpha = np.asarray(
         Image.fromarray(sprite.alpha.astype(np.uint8) * 255).resize(size, Image.NEAREST))
     return Sprite(card=sprite.card, kind=sprite.kind, team=sprite.team,
-                  rgb=rgb, alpha=alpha > 127, tile=sprite.tile)
+                  rgb=rgb, alpha=alpha > 127, tile=sprite.tile,
+                  facing=sprite.facing)
 
 
 # ------------------------------------------------------------- compositing
@@ -311,7 +351,8 @@ def compose_scene(
             card=placed.card, kind=placed.kind.value, team=team,
             x0=max(0, x0), y0=max(0, y0),
             x1=min(canvas.shape[1], x1), y1=min(canvas.shape[0], y1),
-            tile_x=tile[0], tile_y=tile[1], visibility=0.0))
+            tile_x=tile[0], tile_y=tile[1], visibility=0.0,
+            identity_supervised=placed.facing == facing_of(team)))
         areas.append(int(placed.alpha.sum()))
 
     visible = np.bincount(owner[owner >= 0].ravel(), minlength=len(planned))

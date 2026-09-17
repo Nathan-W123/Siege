@@ -510,6 +510,17 @@ card to learn what it looks like. A card's sprite is the same sprite whoever
 plays it, and only the health bar is team-tinted — one hue rotation away
 (`synth.recolor_team`).
 
+**With one real limit.** You play from the bottom, so your troops walk up
+the board and show their backs while the opponent's walk down and show their
+fronts, and those are separate art — no flip turns one into the other. A
+retinted friendly sprite is therefore a truthful enemy example of *where*,
+*whose*, *how big* and *what kind*, and a false one of *which card*. Those
+examples are marked `identity_supervised=False`, train a trailing
+"entity, card unknown" heatmap channel instead of a card channel, and have
+the card channels' loss masked where they sit — so the model is never taught
+that an enemy Knight looks like the back of one. Enemy card identity arrives
+in step 4 instead, from real frames facing the right way.
+
 **2. Composite** (`src/live/synth.py`). Harvested sprites were alone on an
 empty board, so paste them back at random tiles in random overlapping
 combinations. Because it placed them, it knows every box, class, kind and

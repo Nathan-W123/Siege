@@ -175,7 +175,8 @@ def test_forward_shapes_match_the_configured_stride():
 
     outputs = build_detector(config)(torch.zeros(2, 3, 64, 64))
 
-    assert outputs["heatmap"].shape == (2, len(CARDS), out_h, out_w)
+    # Cards plus the trailing "entity, card not known" channel.
+    assert outputs["heatmap"].shape == (2, len(CARDS) + 1, out_h, out_w)
     assert outputs["size"].shape == (2, 2, out_h, out_w)
     assert outputs["team"].shape == (2, len(TEAMS), out_h, out_w)
     assert outputs["kind"].shape == (2, len(KINDS), out_h, out_w)
@@ -354,3 +355,105 @@ def test_checkpoint_carries_its_card_list(tmp_path):
     with torch.no_grad():
         image = torch.rand(1, 3, 64, 64)
         assert torch.allclose(loaded(image)["heatmap"], model.eval()(image)["heatmap"])
+
+
+# ----------------------------------------------------- the unnamed channel
+
+
+def _unsupervised(**overrides):
+    a = _annotation(**overrides)
+    a["identity_supervised"] = False
+    return a
+
+
+def test_an_unsupervised_example_trains_the_unnamed_channel(): 
+    """A friendly sprite retinted into an enemy has the right silhouette and
+    the wrong face. It may teach "an entity is here"; it may not teach which
+    card, because a real enemy of that card shows a front."""
+    config = _config()
+
+    targets = encode_targets([_unsupervised(card="knight")], (64, 64), config)
+
+    assert targets["heatmap"][config.unnamed_channel].max() == pytest.approx(1.0)
+    assert not targets["heatmap"][CARDS.index("knight")].any()
+
+
+def test_a_supervised_example_still_trains_its_card_channel():
+    config = _config()
+
+    targets = encode_targets([_annotation(card="knight")], (64, 64), config)
+
+    assert targets["heatmap"][CARDS.index("knight")].max() == pytest.approx(1.0)
+    assert not targets["heatmap"][config.unnamed_channel].any()
+    assert not targets["identity_ignore"].any()
+
+
+def test_box_team_and_kind_are_supervised_either_way():
+    """Everything that transfers across facing still gets taught. Only the
+    card name is withheld."""
+    config = _config()
+
+    supervised = encode_targets([_annotation()], (64, 64), config)
+    withheld = encode_targets([_unsupervised()], (64, 64), config)
+
+    assert np.array_equal(supervised["mask"], withheld["mask"])
+    assert np.allclose(supervised["size"], withheld["size"])
+    assert np.array_equal(supervised["team"], withheld["team"])
+    assert np.array_equal(supervised["kind"], withheld["kind"])
+
+
+def test_the_card_channels_are_not_scored_where_identity_is_withheld():
+    """The subtle half of the fix.
+
+    Leaving those cells in the loss as ordinary background would teach "an
+    enemy facing away is not a Knight" — a claim about facing, dressed up as
+    one about identity. So the loss must not move when the card channels'
+    predictions there change.
+    """
+    config = _config()
+    targets = _batch(encode_targets([_unsupervised(card="knight")], (64, 64), config))
+    out_w, out_h = config.out_size
+
+    # Only inside the withheld region. Outside it the card channels are
+    # ordinary background and must still be scored as such.
+    withheld = targets["identity_ignore"][0].bool()
+    assert withheld.any()
+
+    def outputs(card_logit):
+        heat = torch.full((1, config.n_heatmap, out_h, out_w), -4.0)
+        heat[0, CARDS.index("knight")][withheld] = card_logit
+        return {"heatmap": heat,
+                "size": torch.zeros(1, 2, out_h, out_w),
+                "offset": torch.zeros(1, 2, out_h, out_w),
+                "team": torch.zeros(1, len(TEAMS), out_h, out_w),
+                "kind": torch.zeros(1, len(KINDS), out_h, out_w)}
+
+    quiet, _ = detector_loss(outputs(-4.0), targets)
+    shouting, _ = detector_loss(outputs(6.0), targets)
+
+    assert float(quiet.detach()) == pytest.approx(float(shouting.detach()), rel=1e-5)
+
+
+def test_an_unnamed_peak_decodes_to_a_real_box_with_no_card():
+    """What the bootstrap detector gives `autolabel` to work with: a found
+    enemy with a deliberately empty name. The tracker supplies the name."""
+    config = _config(score_threshold=0.2)
+    out_w, out_h = config.out_size
+    heat = torch.full((1, config.n_heatmap, out_h, out_w), -10.0)
+    heat[0, config.unnamed_channel, 5, 6] = 4.0
+    size = torch.zeros(1, 2, out_h, out_w)
+    size[0, :, 5, 6] = torch.tensor([16.0, 24.0])
+    team = torch.zeros(1, len(TEAMS), out_h, out_w)
+    team[0, TEAMS.index("hostile"), 5, 6] = 5.0
+    kind = torch.zeros(1, len(KINDS), out_h, out_w)
+    kind[0, KINDS.index(CardType.BUILDING), 5, 6] = 5.0
+
+    found = decode({"heatmap": heat, "size": size,
+                    "offset": torch.zeros(1, 2, out_h, out_w),
+                    "team": team, "kind": kind}, config)[0]
+
+    assert len(found) == 1
+    assert found[0].card == ""
+    assert found[0].team == "hostile"
+    assert found[0].kind == CardType.BUILDING
+    assert found[0].x1 - found[0].x0 == pytest.approx(16.0)

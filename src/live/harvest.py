@@ -55,6 +55,27 @@ import numpy as np
 from src.live.vision import TEAM_FRIENDLY, connected_components
 from src.simulator.constants import CardType
 
+# Which way a harvested sprite is facing the camera.
+#
+# This is not cosmetic. You play from the bottom of the screen, so your own
+# troops walk *up* the board and you only ever see their backs; the
+# opponent's walk down and you only ever see their fronts. A card harvested
+# from your own deploys therefore has exactly one of the two appearances the
+# detector will meet, and no transform recovers the other — a horizontal
+# flip mirrors a back into a back, and CR draws the two facings as separate
+# art rather than as one sprite rotated.
+#
+# So facing travels with every sprite, and `synth` uses it to decide which
+# supervision an example is entitled to. See `Annotation.identity_supervised`.
+FACING_AWAY = "away"        # walking up the board: what our own units show
+FACING_TOWARD = "toward"    # walking down: what the opponent's units show
+FACING_UNKNOWN = "unknown"
+
+
+def facing_of(team: str) -> str:
+    """The facing a team's units actually present to the camera."""
+    return FACING_AWAY if team == TEAM_FRIENDLY else FACING_TOWARD
+
 
 @dataclass(frozen=True)
 class HarvestConfig:
@@ -94,6 +115,7 @@ class Sprite:
     rgb: np.ndarray            # (h, w, 3) uint8
     alpha: np.ndarray          # (h, w) bool
     tile: tuple[float, float] | None = None   # where it was harvested
+    facing: str = FACING_AWAY  # see the FACING_* constants above
 
     @property
     def size(self) -> tuple[int, int]:
@@ -186,6 +208,7 @@ def harvest(
     count: int = 1,
     team: str = TEAM_FRIENDLY,
     tile: tuple[float, float] | None = None,
+    facing: str | None = None,
     config: HarvestConfig | None = None,
 ) -> list[Sprite]:
     """Sprites for `card` in one frame, labelled by construction.
@@ -216,7 +239,8 @@ def harvest(
         window = (slice(blob.y0, blob.y1 + 1), slice(blob.x0, blob.x1 + 1))
         sprites.append(Sprite(
             card=card, kind=kind, team=team,
-            rgb=array[window].copy(), alpha=mask[window].copy(), tile=tile))
+            rgb=array[window].copy(), alpha=mask[window].copy(), tile=tile,
+            facing=facing or facing_of(team)))
     return sprites
 
 
@@ -228,6 +252,7 @@ def harvest_sequence(
     count: int = 1,
     team: str = TEAM_FRIENDLY,
     tile: tuple[float, float] | None = None,
+    facing: str | None = None,
     skip_frames: int = 12,
     config: HarvestConfig | None = None,
 ) -> list[Sprite]:
@@ -241,7 +266,7 @@ def harvest_sequence(
     sprites: list[Sprite] = []
     for frame in list(frames)[skip_frames:]:
         sprites.extend(harvest(frame, plate, card, kind=kind, count=count,
-                               team=team, tile=tile, config=config))
+                               team=team, tile=tile, facing=facing, config=config))
     return sprites
 
 
@@ -290,7 +315,8 @@ class SpriteLibrary:
                 payload[f"alpha_{i}"] = sprite.alpha
                 payload[f"meta_{i}"] = np.asarray(
                     [sprite.kind.value, sprite.team,
-                     "" if sprite.tile is None else f"{sprite.tile[0]},{sprite.tile[1]}"])
+                     "" if sprite.tile is None else f"{sprite.tile[0]},{sprite.tile[1]}",
+                     sprite.facing])
             np.savez_compressed(directory / f"{card}.npz", **payload)
 
     @classmethod
@@ -301,9 +327,15 @@ class SpriteLibrary:
             card = path.stem
             for key in sorted(k for k in data.files if k.startswith("rgb_")):
                 i = key.split("_", 1)[1]
-                kind, team, tile = (str(v) for v in data[f"meta_{i}"])
+                meta = [str(v) for v in data[f"meta_{i}"]]
+                kind, team, tile = meta[0], meta[1], meta[2]
+                # Libraries saved before facing was tracked have three-field
+                # meta. They were all harvested from own deploys, so the
+                # default is the truth for them rather than a guess.
+                facing = meta[3] if len(meta) > 3 else FACING_AWAY
                 library.add(Sprite(
                     card=card, kind=CardType(kind), team=team,
                     rgb=data[f"rgb_{i}"], alpha=data[f"alpha_{i}"].astype(bool),
-                    tile=tuple(float(v) for v in tile.split(",")) if tile else None))
+                    tile=tuple(float(v) for v in tile.split(",")) if tile else None,
+                    facing=facing))
         return library

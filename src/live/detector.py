@@ -38,6 +38,27 @@ Anchor-free also fits the subject. Arena units occupy a narrow band of
 apparent sizes, set by the perspective, and a centre-plus-size
 parameterization spends no capacity on the box shapes that never occur.
 
+The unnamed channel, and why facing forces it
+---------------------------------------------
+The heatmap carries one channel per card **plus one more**: "an entity is
+here and its card is not being taught". It exists because of how the arena
+is drawn. You play from the bottom, so your own troops walk up the board and
+show their backs while the opponent's walk down and show their fronts, and
+those are separate art -- no flip turns one into the other. A harvest from
+your own deploys therefore has the right silhouette, size and bar tint for
+an enemy example, and the wrong face.
+
+Those examples train the unnamed channel instead of a card channel, and the
+card channels' loss is masked where they sit, so the model is never told
+that an enemy Knight looks like the back of one. What it learns from them is
+everything that does transfer: where the entity is, how big, whose, and
+whether it is a building.
+
+That is also exactly what bootstraps `autolabel.py`, which needs the
+detector to *find* an enemy, not to name it -- the name comes from the cycle
+tracker. So enemy card identity enters the model on the next training round,
+from real frames, facing the right way.
+
 Three heads, because abstention should be partial
 -------------------------------------------------
 Card identity, team and kind are predicted separately rather than as one
@@ -86,6 +107,15 @@ class DetectorConfig:
 
     @property
     def n_cards(self) -> int:
+        return len(self.cards)
+
+    @property
+    def n_heatmap(self) -> int:
+        """Card channels plus the trailing unnamed-entity channel."""
+        return len(self.cards) + 1
+
+    @property
+    def unnamed_channel(self) -> int:
         return len(self.cards)
 
     @property
@@ -169,12 +199,17 @@ def encode_targets(annotations, scene_size, config: DetectorConfig):
     sx = config.input_size[0] / float(scene_size[0])
     sy = config.input_size[1] / float(scene_size[1])
 
-    heatmap = np.zeros((max(1, config.n_cards), out_h, out_w), np.float32)
+    heatmap = np.zeros((config.n_heatmap, out_h, out_w), np.float32)
     size = np.zeros((2, out_h, out_w), np.float32)
     offset = np.zeros((2, out_h, out_w), np.float32)
     team = np.zeros((out_h, out_w), np.int64)
     kind = np.zeros((out_h, out_w), np.int64)
     mask = np.zeros((out_h, out_w), np.float32)
+    # Cells where no card channel may be scored at all — neither as a
+    # positive nor as a background negative. Scoring them as background
+    # would teach "an enemy facing away is not a Knight", which is a
+    # statement about facing dressed up as one about identity.
+    identity_ignore = np.zeros((out_h, out_w), np.float32)
 
     for a in annotations:
         card = a["card"] if isinstance(a, dict) else a.card
@@ -192,16 +227,26 @@ def encode_targets(annotations, scene_size, config: DetectorConfig):
         if not (0 <= ix < out_w and 0 <= iy < out_h):
             continue
 
-        _splat(heatmap[card_to_id[card]], ix, iy,
-               gaussian_radius(bh / config.stride, bw / config.stride))
+        supervised = (a.get("identity_supervised", True) if isinstance(a, dict)
+                      else getattr(a, "identity_supervised", True))
+        radius = gaussian_radius(bh / config.stride, bw / config.stride)
+        if supervised:
+            _splat(heatmap[card_to_id[card]], ix, iy, radius)
+        else:
+            _splat(heatmap[config.unnamed_channel], ix, iy, radius)
+            _splat(identity_ignore, ix, iy, radius)
         size[:, iy, ix] = (bw, bh)
         offset[:, iy, ix] = (cx - ix, cy - iy)
         team[iy, ix] = TEAMS.index(a["team"] if isinstance(a, dict) else a.team)
         kind[iy, ix] = KIND_TO_ID[a["kind"] if isinstance(a, dict) else a.kind]
         mask[iy, ix] = 1.0
 
+    # A cell only needs shielding where the splat actually reached, so
+    # threshold the ignore map back to a hard disc rather than carrying the
+    # Gaussian's tail out across the board.
     return {"heatmap": heatmap, "size": size, "offset": offset,
-            "team": team, "kind": kind, "mask": mask}
+            "team": team, "kind": kind, "mask": mask,
+            "identity_ignore": (identity_ignore > 0.05).astype(np.float32)}
 
 
 # -------------------------------------------------------------------- model
@@ -253,7 +298,7 @@ def _build_model(config: DetectorConfig):
             # initialised at 0.5 spends its first epochs driving almost
             # every cell of an almost-empty heatmap down, and frequently
             # collapses to predicting nothing at all before it recovers.
-            self.heatmap = head(max(1, config.n_cards), bias=-2.19)
+            self.heatmap = head(config.n_heatmap, bias=-2.19)
             self.size = head(2)
             self.offset = head(2)
             self.team = head(len(TEAMS))
@@ -284,13 +329,19 @@ def build_detector(config: DetectorConfig):
 # --------------------------------------------------------------------- loss
 
 
-def focal_loss(pred_logits, target):
+def focal_loss(pred_logits, target, keep=None):
     """CenterNet's penalty-reduced focal loss.
 
     Cells near a true centre are not simply negatives — the Gaussian says
     how nearly right they are — so their penalty is scaled by `(1 - t)^4`.
     Treating them as hard negatives fights the splat that was drawn on
     purpose and blurs every centre it is trying to sharpen.
+
+    `keep` is an optional 0/1 weight broadcast over the prediction, used to
+    take the card channels out of the loss wherever an example was not
+    entitled to supervise identity. Weighting to zero rather than dropping
+    the cells keeps the tensor shapes uniform, which matters because the
+    normalizing count is taken over the same masked quantity.
     """
     import torch
 
@@ -301,6 +352,10 @@ def focal_loss(pred_logits, target):
     pos_loss = -torch.log(pred) * torch.pow(1.0 - pred, 2.0) * positive
     neg_loss = (-torch.log(1.0 - pred) * torch.pow(pred, 2.0)
                 * torch.pow(1.0 - target, 4.0) * negative)
+    if keep is not None:
+        positive = positive * keep
+        pos_loss = pos_loss * keep
+        neg_loss = neg_loss * keep
 
     n = positive.sum()
     if n == 0:
@@ -317,6 +372,7 @@ def detector_loss(outputs, targets, weights=(1.0, 0.1, 1.0, 0.5, 0.5)):
     in pixels while everything else is a probability: left at parity its
     gradients dominate and the heatmap never sharpens.
     """
+    import torch
     import torch.nn.functional as F
 
     w_hm, w_size, w_off, w_team, w_kind = weights
@@ -324,7 +380,15 @@ def detector_loss(outputs, targets, weights=(1.0, 0.1, 1.0, 0.5, 0.5)):
     n = mask.sum().clamp(min=1.0)
     pick = mask.bool()
 
-    parts = {"heatmap": focal_loss(outputs["heatmap"], targets["heatmap"])}
+    # Shield the card channels where identity was not supervised, and leave
+    # the trailing unnamed channel scored everywhere — that channel is the
+    # one those examples exist to train.
+    keep = None
+    ignore = targets.get("identity_ignore")
+    if ignore is not None and float(ignore.sum()) > 0.0:
+        keep = torch.ones_like(outputs["heatmap"])
+        keep[:, :-1] = (1.0 - ignore).unsqueeze(1)
+    parts = {"heatmap": focal_loss(outputs["heatmap"], targets["heatmap"], keep)}
 
     # Regressions and classifications are supervised only at true centres.
     # Everywhere else there is no box to predict the size of, and averaging
@@ -387,6 +451,8 @@ def decode(outputs, config: DetectorConfig, max_detections: int = 40):
             cy = (iy + oy) * config.stride
             team = TEAMS[int(outputs["team"][b, :, iy, ix].argmax())]
             kind = KINDS[int(outputs["kind"][b, :, iy, ix].argmax())]
+            # The trailing channel is "entity, card not known" — a real
+            # detection with a deliberately empty name, not a failure.
             card = config.cards[cls] if cls < config.n_cards else ""
             detections.append(DetectedEntity(
                 card=card if score >= config.identity_threshold else "",

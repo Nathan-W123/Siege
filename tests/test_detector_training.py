@@ -71,7 +71,7 @@ def test_dataset_yields_tensors_the_model_accepts(dataset_dir):
     image, targets, annotations, scene_size = dataset[0]
 
     assert image.shape == (3, 64, 64)
-    assert targets["heatmap"].shape == (config.n_cards, out_h, out_w)
+    assert targets["heatmap"].shape == (config.n_heatmap, out_h, out_w)
     assert targets["mask"].shape == (out_h, out_w)
     assert scene_size == SIZE
     assert annotations
@@ -127,7 +127,7 @@ def test_the_trained_checkpoint_reloads_with_its_cards(dataset_dir, tmp_path):
     assert loaded.cards == config.cards
     assert loaded.input_size == (64, 64)
     with torch.no_grad():
-        assert model(torch.zeros(1, 3, 64, 64))["heatmap"].shape[1] == len(loaded.cards)
+        assert model(torch.zeros(1, 3, 64, 64))["heatmap"].shape[1] == loaded.n_heatmap
 
 
 def test_a_training_log_is_written_when_asked(dataset_dir, tmp_path):

@@ -249,3 +249,62 @@ def arena_of(scene):
     from src.simulator.cards import load_arena
 
     return load_arena()
+
+
+# ------------------------------------------------------------------ facing
+
+
+def test_retinting_does_not_claim_to_have_turned_the_sprite_around(scene):
+    """Recolouring the bar makes a hostile-looking example out of a friendly
+    sprite. It does not, and cannot, change which way the unit faces."""
+    from src.live.harvest import FACING_AWAY
+
+    _, _, _, library = scene
+    friendly = library.get("knight")[0]
+
+    hostile = recolor_team(friendly, TEAM_HOSTILE)
+
+    assert hostile.team == TEAM_HOSTILE
+    assert hostile.facing == FACING_AWAY, "facing must survive a retint untouched"
+
+
+def test_team_swapped_examples_do_not_supervise_identity(scene):
+    """The point of the whole facing split.
+
+    Every sprite here was harvested from our own deploys, so it shows a
+    back. Pasted as an enemy it is a truthful example of *where* and *whose*
+    and *what kind*, and a false one of *which card* -- a real enemy of that
+    card shows a face. Teaching the card name from it would teach the wrong
+    appearance, which is worse than teaching nothing.
+    """
+    background, _, homography, library = scene
+
+    _, annotations = compose_scene(background, library, homography, arena_of(scene),
+                                   np.random.default_rng(5),
+                                   SynthConfig(min_units=14, max_units=14))
+
+    hostile = [a for a in annotations if a.team == TEAM_HOSTILE]
+    friendly = [a for a in annotations if a.team == TEAM_FRIENDLY]
+    assert hostile and friendly, "seed produced only one team; pick another"
+    assert not any(a.identity_supervised for a in hostile)
+    assert all(a.identity_supervised for a in friendly)
+
+
+def test_a_correctly_facing_sprite_does_supervise_identity(scene, arena):
+    """Once real enemy sprites are banked, the same path supervises them."""
+    from src.live.harvest import FACING_TOWARD, SpriteLibrary, harvest
+    from tests.live_frames import render_unit_with_body
+
+    background, plate, homography, _ = scene
+    frame, _ = render_unit_with_body(arena, (9.0, 20.0), team=TEAM_HOSTILE)
+    library = SpriteLibrary()
+    library.extend(harvest(frame, plate, "knight", team=TEAM_HOSTILE,
+                           facing=FACING_TOWARD, tile=(9.0, 20.0), config=CONFIG))
+
+    _, annotations = compose_scene(background, library, homography, arena_of(scene),
+                                   np.random.default_rng(5),
+                                   SynthConfig(min_units=14, max_units=14))
+
+    hostile = [a for a in annotations if a.team == TEAM_HOSTILE]
+    assert hostile
+    assert all(a.identity_supervised for a in hostile)
