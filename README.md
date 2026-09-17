@@ -20,7 +20,8 @@ A reinforcement learning agent that learns to play Clash Royale entirely inside 
 | Domain randomization | ✅ | Degraded enemy detections for training (`src/agent/obs_noise.py`) |
 | Teacher→student distillation | ✅ | Privileged teacher, live-legal student (`src/agent/distill.py`) |
 | Opponent tracker | ✅ | Derives opponent elixir + cycle from observed play (`src/agent/opponent_tracker.py`) |
-| Arena perception | ✅ | Homography + team-tinted blob detection (`src/live/`) |
+| Arena perception | ✅ | Homography, learned entity detector, spell events (`src/live/`) |
+| Label-free training data | ✅ | Sprite harvest, synthetic scenes, self-labelling (`src/live/`) |
 | Inference-time search | ✅ | Sim-only rollout search (`src/agent/search.py`) |
 | Population-based training | ✅ | Hyperparameter search on the frozen benchmark (`src/agent/pbt.py`) |
 | 3D network viewer | ✅ | Live WebGL view of the policy while it trains or plays (`src/viz/`) |
@@ -451,25 +452,100 @@ scope" below and CLAUDE.md.
   perception, tile→pixel so a trained policy can deploy anywhere instead of
   at one fixed configured point. Degenerate or inconsistent anchors are
   rejected at config load, not mid-session.
+- **`src/live/detector.py`** — the learned entity detector, and the main
+  path. Anchor-free (CenterNet-style) so decode cost does not grow with how
+  busy the board is, and small enough to share the ~0.5s decision budget
+  with a policy forward pass. Card, team and kind are **separate heads**: a
+  card name among a hundred is hard, while friendly-or-hostile and
+  troop-or-building stay accurate long after identity gives up. Below the
+  identity threshold the card blanks and the kind, team and position still
+  come through — which matters because kind decides which observation
+  channel the entity lands in at all.
+- **`src/live/spells.py`** — spell casts, from frame-to-frame change. A
+  spell is not an object: no health bar, no team tint, nothing left behind,
+  so no per-frame detector can find one at any threshold. What it has is a
+  temporal signature — a bloom that grows, peaks and collapses in under a
+  second, in place, where a walking troop's change region translates and
+  holds its area. Position and radius are measured off the VFX and projected
+  through the homography, so the radius is perspective-corrected.
 - **`src/live/vision.py`** — team-tinted health-bar segmentation, connected
-  components, and HP from bar fill. *Known fidelity loss:* a full bar has no
-  visible remainder, so "full HP" and "bar occluded" are the same pixels;
-  those detections are reported at full HP with `hp_confident=False`.
-- **`src/live/identify.py`** — card identity by template matching, narrowed
-  by the deck prior: a deck is 8 cards and reveals itself, so once all eight
-  are known the classifier chooses among eight, not 110. It reads the
-  revealed-card set straight off the opponent tracker rather than keeping a
-  second copy.
+  components, and HP from bar fill. Retained because bar fill is the one
+  thing the detector does **not** read: it is not trained on HP, and a
+  fabricated fraction would flow into the trade arithmetic the policy
+  defends with. *Known fidelity loss:* a full bar has no visible remainder,
+  so "full HP" and "bar occluded" are the same pixels; those detections are
+  reported at full HP with `hp_confident=False`.
+- **`src/live/identify.py`** — template matching over the deck prior. The
+  original identity path, kept as a no-training fallback for when no
+  detector checkpoint has been trained yet. Its bounding cost — a template
+  library is specific to one skin at one resolution, and opponent cards need
+  hand labelling — is what the pipeline below removes.
 - **`src/agent/opponent_tracker.py`** — opponent elixir and hand, *derived*
   from observed play (start value + known regen + observed card costs, and
   the deterministic 8-card cycle) rather than read. It consumes only what
   perception reported and never touches engine state, so it is wrong exactly
   when perception was wrong — the same failure mode a human has.
 
-Detector templates and annotated frames are not bundled: they are
-display-specific. `tests/live_frames.py` documents the fixture format and
-generates a synthetic frame; drop real annotated captures into
+Detector templates, sprites, checkpoints and annotated frames are not
+bundled: they are display-specific, and shipping someone else's would be
+worse than having none. `tests/live_frames.py` documents the fixture format
+and generates synthetic frames; drop real annotated captures into
 `tests/fixtures/live/` and the test suite picks them up automatically.
+
+### Training the detector without labelling anything
+
+The detector needs labelled data and nobody labels any. Four steps, each
+producing labels as a byproduct of something you were doing anyway.
+
+**1. Harvest** (`src/live/harvest.py`). Deploy a known card onto an empty
+arena and difference the frame against a plate of that same arena. What is
+left is that card's pixels with a pixel-exact alpha, named because you chose
+it; stepping the frames yields every animation pose and facing. The plate is
+a median, not a mean — the arena is never still, and a mean smears the river
+animation into the plate where it subtracts forever after as a faint
+permanent sprite.
+
+The assumption worth naming: you never need the *opponent* to show you a
+card to learn what it looks like. A card's sprite is the same sprite whoever
+plays it, and only the health bar is team-tinted — one hue rotation away
+(`synth.recolor_team`).
+
+**2. Composite** (`src/live/synth.py`). Harvested sprites were alone on an
+empty board, so paste them back at random tiles in random overlapping
+combinations. Because it placed them, it knows every box, class, kind and
+team exactly. Sprites are rescaled by the perspective ratio between where
+they were harvested and where they land — the homography knows that factor —
+and scenes paint back to front so nearer units occlude farther ones, the
+only occlusion order the game produces. Occlusion is *measured* with an
+owner map, and a sprite left too buried loses its annotation rather than
+teaching the detector to hallucinate units behind units.
+
+```bash
+python -m src.live.train_detector --manifest data/synth/manifest.json \
+    --out checkpoints/detector.pt --epochs 20
+```
+
+**3. Watch recall, not loss.** Detection losses fall smoothly while the
+model still finds nothing — background cells dominate them. Training reports
+centre recall and identity accuracy, which are also the two failure modes in
+play: a miss is a blind spot, a wrong name is a bad trade, and only the
+second is recoverable.
+
+**4. Self-label** (`src/live/autolabel.py`). Synthetic scenes are wrong in
+ways that only show on a real frame: real pushes clump along lanes, harvest
+artifacts repeat thousands of times, nothing is ever drawn mid-death.
+`OpponentTracker` fixes this for free — by the time a card is played it
+knows the deck, the hand, and what they can afford. Stack that against the
+detector's kind and the number of bodies that appeared at once (three
+together is a card with `count == 3`) and the answer is usually forced. One
+survivor is a deduction, not a guess, and the crop under it is a labelled
+example on a real frame in your skin at your resolution. More than one
+survivor banks nothing.
+
+Banked frames use the same manifest format as the synthetic ones, so a
+training run mixes them by pointing at both. Play, bank, retrain, play — a
+new arena skin or a new season becomes a night of self-labelling rather than
+an afternoon of anyone's time.
 
 ---
 

@@ -60,16 +60,41 @@ vision pipeline is currently tested only against synthetic frames.
 
 1. `python -m src.live --diagnose` to capture a frame and print what match
    and ready detection actually see.
-2. Label a handful of real captures into `tests/fixtures/live/` — see
+2. Record an **empty arena** (a few seconds, no units) and a deploy pass:
+   place each card in your deck alone and record it. This is the input to
+   the label-free pipeline and it is the only manual step in it — you are
+   playing the cards, not labelling anything.
+
+   ```bash
+   # harvest -> composite -> train; see README, "Training the detector
+   # without labelling anything"
+   python -m src.live.train_detector --manifest data/synth/manifest.json \
+       --out checkpoints/detector.pt --epochs 20
+   ```
+
+3. Label a handful of real captures into `tests/fixtures/live/` — see
    `tests/live_frames.py` for the format. The test suite picks them up
-   automatically and holds them to the same assertions as the synthetic one.
-3. Re-fit the thresholds in `vision.DEFAULT_TEAM_COLORS` and `VisionConfig`
-   against those frames. The shipped values are starting points; exact tints
-   shift with arena skin and display colour management.
-4. Measure your actual detection error and refit `obs_noise` in
-   `configs/training_human.yaml`. Those rates are **placeholders**. Noise
-   that is qualitatively wrong — a systematic homography bias modelled as
-   zero-mean jitter — transfers worse than no randomization at all.
+   automatically and holds them to the same assertions as the synthetic
+   ones. This is for *testing*, not training: a dozen frames is plenty to
+   catch a broken homography or an off-by-one crop, and the detector never
+   sees them.
+4. If you are running the `vision.py` bar segmenter for HP (you probably
+   are — the detector does not read HP), re-fit `vision.DEFAULT_TEAM_COLORS`
+   and `VisionConfig` against those frames. The shipped values are starting
+   points; exact tints shift with arena skin and display colour management.
+   The detector itself needs no such refit — appearance randomization during
+   training is what buys that.
+5. Measure your actual detection error and refit `obs_noise` in
+   `configs/training_human.yaml`. Those rates are **placeholders**. The
+   recall reported by `train_detector` is a first estimate of `1 - p_miss`,
+   but it is measured on synthetic scenes; re-measure on real captures
+   before training a policy against it. Noise that is qualitatively wrong —
+   a systematic homography bias modelled as zero-mean jitter — transfers
+   worse than no randomization at all.
+6. Once the detector runs live, turn on self-labelling
+   (`src/live/autolabel.py`). It banks real frames the cycle tracker can
+   name unambiguously, and retraining on synthetic plus banked is what
+   closes the gap composited scenes leave.
 
 ---
 

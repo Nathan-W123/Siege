@@ -12,13 +12,26 @@ That revealed-card state is exactly what the deterministic tracker (#38)
 already maintains, so this module *reads* it rather than keeping a second,
 divergent copy — `OpponentTracker.candidate_cards()` is the single source.
 
-**Escalation path.** Template matching over the candidate set first; it is
-cheap, needs no training, and the deck prior does most of the work. Only
-fine-tune a detector (YOLOv8n / RT-DETR) if measurement shows template
-matching is the binding constraint. The real cost of the detector route is
-labels: our *own* units can be labelled semi-automatically (we know what we
-just deployed and where — see `learn_from_own_deploy`), but opponent units
-need hand labelling.
+**Status: the no-training fallback.** This was the first identity path, and
+it is kept for the case where no detector checkpoint has been trained yet —
+it is cheap, needs no data, and the deck prior does most of the work.
+`src/live/detector.py` is the main path now.
+
+The escalation this docstring originally described ("only fine-tune a
+detector if measurement shows template matching is the binding constraint")
+named the right blocker and drew the wrong conclusion from it. The blocker
+was labels: our own units label semi-automatically from `learn_from_own_deploy`,
+and opponent units looked like they needed hand labelling. They do not. A
+card's sprite is the same sprite whoever plays it, so you can harvest every
+card from your *own* deploys (`src/live/harvest.py`) and retint the one
+team-coloured part of it (`synth.recolor_team`); and when a real opponent
+frame does need naming, the deterministic cycle tracker deduces it from the
+kind, the spawn count and what they could afford (`src/live/autolabel.py`).
+Neither route asks anyone to label anything.
+
+What remains true of template matching is its bound: a library is specific
+to one skin at one resolution, and every new season re-costs it. That is the
+reason it is the fallback rather than the target.
 
 Templates are not bundled: they are display- and skin-specific, and shipping
 someone else's would be worse than having none. Build them from your own
