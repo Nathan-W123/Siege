@@ -553,6 +553,26 @@ centre recall and identity accuracy, which are also the two failure modes in
 play: a miss is a blind spot, a wrong name is a bad trade, and only the
 second is recoverable.
 
+#### Testing it without a live match
+
+Record once, replay as often as you like — on any machine, with the game
+shut, changing thresholds between runs. Recording observes only; it never
+taps.
+
+```bash
+python -m src.live --record 600 --record-out recordings/first
+python -m src.live.replay recordings/first --config configs/live_play.yaml \
+    --save-sprites recordings/first-sprites
+```
+
+The report is ordered so the first thing that is wrong is the first thing
+you read: whether the plate warmed up, whether anything was discovered,
+whether teams were decided by `motion` or fell back to a guess, whether the
+capture was fast enough to resolve a spell, and what was named or skipped
+and why. `--save-sprites` writes out every sprite that was cut, alpha and
+all, because a harvest slicing the top off every unit is obvious as a
+picture and invisible as a statistic.
+
 **5. The loop closes.** With a detector, `autolabel.SelfLabeler` banks real
 frames the cycle tracker can name, and `Discovery` and `DetectedEntity` are
 deliberately interchangeable — geometry bootstraps the loop and the detector

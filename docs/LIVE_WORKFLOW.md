@@ -60,6 +60,28 @@ vision pipeline is currently tested only against synthetic frames.
 
 1. `python -m src.live --diagnose` to capture a frame and print what match
    and ready detection actually see.
+
+1b. **Record, then replay — before arming anything.** Every other way to
+   exercise perception needs a live match, which means the first time you
+   learn whether it works is also the first time it is tapping on your
+   account.
+
+   ```bash
+   python -m src.live --record 600 --record-out recordings/first   # observes only
+   python -m src.live.replay recordings/first --config configs/live_play.yaml \
+       --save-sprites recordings/first-sprites
+   ```
+
+   Read the report top down; each number makes the ones below it meaningless
+   if it is wrong. Did the plate warm up? Were units discovered at all? Were
+   their teams decided by `motion` (trustworthy) or by the `bar`/`side`
+   fallbacks (tracks are being lost — raise `max_drift_px`)? Were spells
+   seen, or was the capture too slow to resolve one? And what was named, or
+   skipped and why.
+
+   `--save-sprites` writes every sprite that was actually cut, as a
+   transparent PNG. A harvest quietly slicing the top off every unit is
+   obvious in two seconds as a picture and nearly invisible as a statistic.
 2. **Just play.** There is no empty-arena recording and no deploy pass.
    `background.RunningPlate` learns the empty arena from ordinary play,
    `discover.EntityDiscoverer` finds new units and classifies them by

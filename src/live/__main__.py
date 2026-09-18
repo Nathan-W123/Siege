@@ -48,6 +48,18 @@ def main() -> None:
         help="Capture one screenshot, print match/ready detection values for it, save it, and exit.",
     )
     parser.add_argument("--diagnose-out", type=Path, default=Path("live_diagnostic.png"))
+    parser.add_argument(
+        "--record", type=int, default=None, metavar="N",
+        help="capture N frames to --record-out and exit, without tapping "
+             "anything. Feed the result to `python -m src.live.replay` to "
+             "exercise the whole perception stack offline, as many times as "
+             "you like, without the game running.")
+    parser.add_argument("--record-out", type=Path, default=Path("recordings/session"))
+    parser.add_argument("--record-interval", type=float, default=0.05,
+                        help="seconds between recorded frames (default 20fps). "
+                             "Faster than `poll_seconds` on purpose: spell "
+                             "detection needs frames close enough together to "
+                             "watch a bloom grow.")
     parser.add_argument("--viz-port", type=int, default=None,
                         help="serve the 3D viewer on this port and mirror the "
                              "runner's output into its terminal pane "
@@ -67,6 +79,12 @@ def main() -> None:
         device = ADBDevice(config.adb_path or "adb", config.device_serial)
     if args.diagnose:
         diagnose(config, device, args.diagnose_out)
+        return
+    if args.record:
+        from src.live.replay import record
+
+        record(device, args.record_out, frames=args.record,
+               interval=args.record_interval)
         return
     log = print
     if args.viz_port:
