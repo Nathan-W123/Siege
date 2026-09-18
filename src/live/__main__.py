@@ -110,7 +110,11 @@ def _build_driver(config, checkpoint_override, log):
     if not checkpoint:
         return None
 
-    from src.agent.selfplay import checkpoint_card_levels, load_checkpoint
+    from src.agent.selfplay import (
+        checkpoint_card_levels,
+        checkpoint_deck,
+        load_checkpoint,
+    )
     from src.live.bridge import PolicyDriver
     from src.simulator.cards import load_arena, load_cards
     from src.simulator.levels import describe, scale_arena, scale_cards
@@ -125,9 +129,40 @@ def _build_driver(config, checkpoint_override, log):
     arena = scale_arena(load_arena(), levels)
 
     deck = list(config.deck) or list(config.preset_deck)
+    _warn_on_deck_mismatch(checkpoint_deck(Path(checkpoint)), deck, log)
     driver = PolicyDriver(net, card_names, cards, arena, deck)
     log(f"Policy driving live play with deck: {', '.join(deck)}")
     return driver
+
+
+def _warn_on_deck_mismatch(trained, deck, log) -> None:
+    """Say something when the policy has never played this deck.
+
+    A warning and not a refusal, deliberately. Every checkpoint carries an
+    embedding slot for all 171 cards and the deck is a runtime argument, so
+    handing a policy an unfamiliar deck is legal and sometimes intended — a
+    `full_pool` policy is *supposed* to play whatever it is given. What is
+    not intended is finding out by watching it play badly, because a policy
+    that has never seen these cards looks exactly like a policy that is
+    simply bad.
+
+    A checkpoint that records no deck was trained on a sampled pool, or
+    predates this being recorded; the two are indistinguishable from here,
+    so both get the same neutral note rather than a false alarm.
+    """
+    if trained is None:
+        log("Checkpoint records no training deck (pooled stage, or saved "
+            "before decks were recorded); cannot check it against yours.")
+        return
+    if set(trained) == set(deck):
+        return
+    unseen = sorted(set(deck) - set(trained))
+    log(f"WARNING: this policy trained on [{', '.join(trained)}] but is "
+        f"being given [{', '.join(deck)}]. "
+        + (f"It has never played: {', '.join(unseen)}. " if unseen else "")
+        + "It will run, and it will play worse than the numbers you "
+          "measured. Train the `my_deck` stage on this deck, or accept it "
+          "knowingly.")
 
 
 if __name__ == "__main__":

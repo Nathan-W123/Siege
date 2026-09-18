@@ -22,13 +22,25 @@ from src.simulator.engine import BattleEngine
 
 
 def save_checkpoint(net: PolicyNetwork, card_names: list[str], path: Path,
-                    card_levels=None) -> None:
+                    card_levels=None, deck=None) -> None:
     """Persist a policy.
 
     `card_levels` is recorded as provenance, not as something the network
     needs: a policy trained against level-13 stats has learned level-13
     breakpoints, and running it live against a level-9 collection would
     quietly mean a different game. Storing it lets the live bridge check.
+
+    `deck` is recorded for exactly the same reason, and it had been missing.
+    The deck is a *runtime* argument — `PolicyDriver` takes it, and every
+    checkpoint carries an embedding slot for all 171 cards — so nothing
+    stops a policy being handed a deck it has never played. It will not
+    error; it will just be bad, in a way that looks like the policy being
+    bad rather than like a configuration mistake. Recording what it trained
+    on lets the bridge say so.
+
+    None means the agent's deck was sampled from a pool rather than pinned,
+    which is a real answer: a `full_pool` policy has no single deck to
+    compare against.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -36,6 +48,8 @@ def save_checkpoint(net: PolicyNetwork, card_names: list[str], path: Path,
         "config": asdict(net.config),
         "card_names": list(card_names),
     }
+    if deck is not None:
+        payload["deck"] = list(deck)
     if card_levels is not None:
         payload["card_levels"] = (card_levels.to_dict()
                                   if hasattr(card_levels, "to_dict") else dict(card_levels))
@@ -51,6 +65,19 @@ def load_checkpoint(path: Path, device: str = "cpu") -> tuple[PolicyNetwork, lis
     net.load_state_dict(ckpt["state_dict"])
     net.eval()
     return net, ckpt["card_names"]
+
+
+def checkpoint_deck(path: Path) -> list[str] | None:
+    """The deck a checkpoint was trained on, or None.
+
+    None covers both "trained on a sampled pool" and "predates this being
+    recorded", and the caller cannot tell them apart. That is why the live
+    bridge warns on a mismatch rather than refusing: it cannot prove the
+    policy is wrong for this deck, only that it cannot vouch for it.
+    """
+    ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
+    deck = ckpt.get("deck")
+    return list(deck) if deck else None
 
 
 def checkpoint_card_levels(path: Path):

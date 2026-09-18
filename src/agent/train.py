@@ -97,6 +97,17 @@ class ShapedRewardFn:
         return r
 
 
+def pinned_deck(stage: CurriculumStage, catalog: DeckCatalog) -> list[str] | None:
+    """The agent's deck for this stage, when the stage pins one.
+
+    None for a pooled stage, where the agent's deck is resampled every
+    episode and so there is no single deck the checkpoint could claim to
+    have been trained on. Recorded into the checkpoint as provenance, so the
+    live bridge can warn when it is handed a different one.
+    """
+    return list(catalog.resolve(stage.deck)) if stage.deck else None
+
+
 def resolve_stage_decks(stage: CurriculumStage, catalog: DeckCatalog, rng):
     if stage.deck:
         name_b = stage.deck
@@ -342,6 +353,10 @@ def train_stage(
 ) -> int:
     shaper = RewardShaper()
     reward_fn = ShapedRewardFn(shaper)
+    # Recorded into every checkpoint this stage writes, so the live bridge
+    # can tell whether the policy it is about to run has ever played the
+    # deck it is being handed. None for a pooled stage.
+    stage_deck = pinned_deck(stage, catalog)
     latest_bot = PolicyBot(net, card_names, name="latest", deterministic=False)
     focused = (FocusedRotationState(stage, catalog, training_cfg)
                if stage.focused_rotation else None)
@@ -565,7 +580,8 @@ def train_stage(
         if global_step >= next_snapshot:
             pool.snapshot(net, card_names, global_step)
             pool.save_ledger()
-            save_checkpoint(net, card_names, run_dir / "latest.pt", card_levels=card_levels)
+            save_checkpoint(net, card_names, run_dir / "latest.pt",
+                            card_levels=card_levels, deck=stage_deck)
             next_snapshot += snapshot_every
 
         if exploiter_cfg.active and global_step >= next_exploiter:
@@ -603,13 +619,15 @@ def train_stage(
                     _report(f"[{stage.name}] PROMOTED: {promote.vs} "
                             f"win rate {confirm[promote.vs]:.2f} "
                             f">= {promote.win_rate}")
-                    save_checkpoint(net, card_names, run_dir / f"{stage.name}_final.pt", card_levels=card_levels)
+                    save_checkpoint(net, card_names, run_dir / f"{stage.name}_final.pt",
+                                    card_levels=card_levels, deck=stage_deck)
                     if tb_writer is not None:
                         tb_writer.close()
                     viz.detach(viz_probe)
                     return global_step
     viz.detach(viz_probe)
-    save_checkpoint(net, card_names, run_dir / f"{stage.name}_final.pt", card_levels=card_levels)
+    save_checkpoint(net, card_names, run_dir / f"{stage.name}_final.pt",
+                    card_levels=card_levels, deck=stage_deck)
     if tb_writer is not None:
         tb_writer.close()
     return global_step
@@ -740,7 +758,8 @@ def main() -> None:
             run_dir=run_dir, global_step=global_step, step_budget=budget,
             n_envs=n_envs, n_workers=n_workers, seed=args.seed, tier=tier,
             obs_noise_cfg=obs_noise_cfg)
-    save_checkpoint(net, card_names, run_dir / "final.pt", card_levels=card_levels)
+    save_checkpoint(net, card_names, run_dir / "final.pt", card_levels=card_levels,
+                    deck=pinned_deck(selected[-1], catalog) if selected else None)
     print(f"[train] done at step {global_step}; saved {run_dir / 'final.pt'}")
 
 
