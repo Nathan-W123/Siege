@@ -316,3 +316,64 @@ def test_a_swarm_is_not_merged_by_the_coarser_plate(arena):
 
     assert found
     assert {d.count for d in found} == {3}
+
+
+# -------------------------------------------------------------- the HUD gate
+
+
+def test_the_hud_is_not_mistaken_for_units(arena, plate):
+    """The failure that would make the overlay useless on a real frame.
+
+    The capture is the whole client area, not the playfield. The elixir bar
+    fills, the timer counts down, card slots animate as they come up, crowns
+    and emotes pop — every one of those is a region that changes against a
+    settled background, which is exactly what a foreground detector notices.
+    Ungated, a real frame grows a permanent row of phantom units along the
+    HUD, and the sprite harvester banks card artwork as though it were a
+    troop.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from src.live.homography import Homography
+    from tests.live_frames import BODY_RGB, _draw_disc, render_empty
+
+    empty, meta = render_empty(arena)
+    homography = Homography.from_anchors(
+        arena, {k: tuple(v) for k, v in meta["homography_anchors"].items()})
+    discoverer = EntityDiscoverer(plate, homography=homography, arena=arena,
+                                  config=CONFIG)
+
+    found = []
+    for i in range(12):
+        frame = np.array(empty)
+        # Where the card slots live: below the board, inside the capture.
+        _draw_disc(frame, 170.0 + i, 1000.0, 14, BODY_RGB)
+        image = Image.fromarray(frame)
+        plate.update(image)
+        found.extend(discoverer.observe(image, now=i * 0.05))
+
+    assert found == []
+    assert discoverer.current(empty) == []
+
+
+def test_units_on_the_board_still_pass_the_gate(arena, plate):
+    """The gate must not be so eager it drops real play."""
+    from src.live.homography import Homography
+    from tests.live_frames import render_empty
+
+    _, meta = render_empty(arena)
+    homography = Homography.from_anchors(
+        arena, {k: tuple(v) for k, v in meta["homography_anchors"].items()})
+    discoverer = EntityDiscoverer(plate, homography=homography, arena=arena,
+                                  config=CONFIG)
+
+    assert _walk(discoverer, plate, arena, (9.0, 26.0), (0.0, -0.8))
+
+
+def test_without_a_homography_nothing_is_gated(arena, plate):
+    """Honest, and the reason calibrating the anchors comes first: with
+    nothing to test against, the HUD is indistinguishable from the board."""
+    discoverer = EntityDiscoverer(plate, config=CONFIG)
+
+    assert _walk(discoverer, plate, arena, (9.0, 26.0), (0.0, -0.8))

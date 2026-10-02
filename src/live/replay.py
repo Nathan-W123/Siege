@@ -359,8 +359,11 @@ def main(argv=None) -> int:
         print(f"sprite library    {len(harvester.library)} sprites "
               f"across {len(harvester.library.cards)} cards")
     if homography is None:
-        print("\nno --config, so no homography: spells were dropped and "
-              "nothing was projected into arena tiles.")
+        print("\nno --config, so no homography: spells were dropped, nothing "
+              "was projected into arena tiles, and — the one that will "
+              "distort these numbers most — the HUD was not gated out, so "
+              "the elixir bar and card slots are being counted as entities. "
+              "Calibrate `homography_anchors` and run this again.")
     if args.json:
         args.json.write_text(json.dumps(report.to_dict(), indent=2))
     return 0

@@ -232,9 +232,65 @@ class Win32Overlay:
                                "the same boxes on recorded frames instead.")
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
         self._gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+        self._declare()
         self._user32.SetProcessDPIAware()
         self._hwnd = self._create_window()
         self._visible = False
+
+    def _declare(self) -> None:
+        """Declare every signature before calling anything.
+
+        Not optional on 64-bit Windows, and the failure is nasty. ctypes
+        defaults an undeclared function's return type to `c_int`, which is
+        32 bits, while every handle here — HWND, HDC, HBITMAP — is 64. An
+        undeclared `CreateWindowExW` therefore returns a *truncated* handle:
+        not zero, so it passes an `if not hwnd` check, and not valid, so
+        every call that uses it fails for reasons that point nowhere near
+        the real cause.
+
+        `device.py` declares its touch-injection signatures for exactly this
+        reason. Same discipline, same reason.
+        """
+        user32, gdi32 = self._user32, self._gdi32
+        # LRESULT and the handle types are pointer-sized; wintypes has no
+        # LRESULT, and c_ssize_t is the right width on both architectures.
+        LRESULT = ctypes.c_ssize_t
+
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+        user32.DefWindowProcW.restype = LRESULT
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, ctypes.c_uint,
+                                          wintypes.WPARAM, wintypes.LPARAM]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetDC.restype = wintypes.HDC
+        user32.GetDC.argtypes = [wintypes.HWND]
+        user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        user32.UpdateLayeredWindow.restype = wintypes.BOOL
+        user32.UpdateLayeredWindow.argtypes = [
+            wintypes.HWND, wintypes.HDC, ctypes.POINTER(wintypes.POINT),
+            ctypes.POINTER(wintypes.SIZE), wintypes.HDC,
+            ctypes.POINTER(wintypes.POINT), wintypes.DWORD,
+            ctypes.POINTER(_BLENDFUNCTION), wintypes.DWORD]
+        user32.PeekMessageW.restype = wintypes.BOOL
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                        wintypes.HWND, ctypes.c_uint,
+                                        ctypes.c_uint, ctypes.c_uint]
+
+        gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+        gdi32.CreateDIBSection.argtypes = [
+            wintypes.HDC, ctypes.POINTER(_BITMAPINFOHEADER), wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
+        gdi32.SelectObject.restype = wintypes.HGDIOBJ
+        gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+        gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        gdi32.DeleteDC.argtypes = [wintypes.HDC]
 
     # ------------------------------------------------------------ lifecycle
 

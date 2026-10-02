@@ -243,7 +243,8 @@ class EntityDiscoverer:
         blobs = [b for b in connected_components(mask)
                  if b.area >= min_area
                  and b.height <= height * cfg.max_extent_fraction
-                 and b.width <= width * cfg.max_extent_fraction]
+                 and b.width <= width * cfg.max_extent_fraction
+                 and self._on_arena(b)]
 
         emitted = self._advance(frame, mask, blobs, now)
         # `max_age` retires tracks that never settled — those are noise. A
@@ -254,6 +255,38 @@ class EntityDiscoverer:
                         if t.missed <= 2
                         and (t.emitted or now - t.first_seen <= cfg.max_age)]
         return emitted
+
+    def _on_arena(self, blob) -> bool:
+        """Is this blob somewhere a unit could actually be standing?
+
+        The capture is the whole client area, not the playfield: the elixir
+        bar fills, the timer counts down, card slots animate as they come up,
+        crowns and emotes pop. Every one of those is a region that changes
+        against a settled background, which is precisely what a foreground
+        detector is built to notice. Without this gate a real frame produces
+        a permanent row of phantom units along the HUD — boxes all over the
+        overlay, and card-slot artwork banked into the sprite library as
+        though it were a troop.
+
+        `vision.detect_units` has always dropped off-board detections for the
+        same reason. This is the same rule for the model-free path.
+
+        Without a calibrated homography there is nothing to test against, so
+        everything passes. That is the honest behaviour — it is also why
+        `homography_anchors` is worth calibrating before trusting any of
+        this, and the replay report says so when they are missing.
+        """
+        if self.homography is None or self.arena is None:
+            return True
+        scale = self.plate.scale
+        feet_x = (blob.x0 + blob.x1 + 1) / 2.0 * scale
+        feet_y = (blob.y1 + 1) * scale
+        try:
+            tile_x, tile_y = self.homography.pixel_to_tile(feet_x, feet_y)
+        except ValueError:
+            return False
+        return (0.0 <= tile_x < self.arena.width
+                and 0.0 <= tile_y < self.arena.height)
 
     def _advance(self, frame, mask, blobs, now: float) -> list[Discovery]:
         cfg = self.config

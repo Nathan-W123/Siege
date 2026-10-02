@@ -7,6 +7,8 @@ from typing import Callable
 
 from src.live.config import LiveConfig, Rect
 from src.live.device import LiveDevice
+from src.simulator.cards import load_arena
+
 from src.live.background import RunningPlate
 from src.live.discover import DiscoverConfig, EntityDiscoverer
 from src.live.spells import SpellConfig, SpellWatcher
@@ -82,7 +84,11 @@ class LiveMatchRunner:
         # ever been trained: the plate learns the empty arena from play and
         # the discoverer finds entities by motion (src/live/discover.py).
         self.plate = RunningPlate()
+        # The arena is what keeps the HUD out of perception: the capture is
+        # the whole client area, so the elixir bar and card slots are inside
+        # it and they change constantly.
         self.discoverer = EntityDiscoverer(self.plate, homography=self.homography,
+                                           arena=load_arena(),
                                            config=DiscoverConfig())
         # A `src.live.overlay.Win32Overlay` when asked for; None otherwise.
         self.overlay = overlay
