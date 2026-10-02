@@ -21,6 +21,7 @@ A reinforcement learning agent that learns to play Clash Royale entirely inside 
 | Teacher→student distillation | ✅ | Privileged teacher, live-legal student (`src/agent/distill.py`) |
 | Opponent tracker | ✅ | Derives opponent elixir + cycle from observed play (`src/agent/opponent_tracker.py`) |
 | Arena perception | ✅ | Homography, learned entity detector, spell events (`src/live/`) |
+| Live overlay | ✅ | Boxes + labels drawn over the running game (`src/live/overlay.py`) |
 | Label-free training data | ✅ | Sprite harvest, synthetic scenes, self-labelling (`src/live/`) |
 | Inference-time search | ✅ | Sim-only rollout search (`src/agent/search.py`) |
 | Population-based training | ✅ | Hyperparameter search on the frozen benchmark (`src/agent/pbt.py`) |
@@ -553,6 +554,38 @@ centre recall and identity accuracy, which are also the two failure modes in
 play: a miss is a blind spot, a wrong name is a bad trade, and only the
 second is recoverable.
 
+#### Seeing what it sees
+
+```bash
+python -m src.live --config configs/live_play.yaml --overlay
+```
+
+Thin boxes over the running game, **blue for yours and red for theirs**,
+labelled with what perception believes:
+
+| Label | Means |
+|---|---|
+| `knight 0.87` | the detector named the card, with that confidence |
+| `troop ?` | found, and known to be a troop, but not identified |
+| `?` | found, too new to say whether it moves |
+
+The `?` labels are the honest ones, not a placeholder. Geometry
+(`discover.py`) answers where, what kind and whose, and never attempts a
+card name; its confidence is 1.0 because it either found something or did
+not. Printing `knight 1.00` there would claim two things that were never
+established. So a glance at the overlay also tells you how far the pipeline
+has got: all `?` means geometry only, names mean a detector is loaded.
+
+It is a click-through, always-on-top layered window, so it never eats a tap
+or steals focus. Windows only; everywhere else `--annotate` draws the same
+boxes on recorded frames.
+
+Measured here at 556x1028, the model-free stack costs **16 ms a frame**
+(~60fps) at the default `downsample: 2`, against 52 ms at full resolution.
+Detection does not need full resolution — a box two pixels out is invisible
+on an overlay and a fraction of a tile once projected — but sprite cutouts
+do, so crops are still taken from the full-resolution frame.
+
 #### Testing it without a live match
 
 Record once, replay as often as you like — on any machine, with the game
@@ -562,8 +595,12 @@ taps.
 ```bash
 python -m src.live --record 600 --record-out recordings/first
 python -m src.live.replay recordings/first --config configs/live_play.yaml \
-    --save-sprites recordings/first-sprites
+    --save-sprites recordings/first-sprites --annotate recordings/first-boxes
 ```
+
+`--annotate` writes every frame with the overlay drawn on it, which is how
+to check the boxes land on the units before trusting the live overlay — and
+the only way to see them at all off Windows.
 
 The report is ordered so the first thing that is wrong is the first thing
 you read: whether the plate warmed up, whether anything was discovered,
