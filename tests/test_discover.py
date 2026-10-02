@@ -50,9 +50,12 @@ def test_the_plate_learns_the_empty_arena_from_ordinary_play(arena, plate):
     the time, so the running median converges on it for free."""
     from tests.live_frames import render_empty
 
-    empty, _ = render_empty(arena)
+    # Compared at plate resolution: the plate is kept at 1/`downsample`,
+    # which is the biggest single lever on the live frame budget.
+    step = plate.scale
+    empty = np.asarray(render_empty(arena)[0])[::step, ::step, :3].astype(int)
 
-    error = np.abs(plate.plate.astype(int) - np.asarray(empty).astype(int)).mean()
+    error = np.abs(plate.plate.astype(int) - empty).mean()
 
     assert error < 1.0
 
@@ -161,9 +164,9 @@ def test_a_swarm_reports_its_size(arena, plate):
 
     found = []
     for i in range(10):
-        # 1.5 tiles apart: far enough that the bodies do not merge into one
-        # blob, close enough to still read as a single deploy.
-        tiles = [((6.5 + j * 1.5, 26.0 - i * 0.8), "hostile") for j in range(3)]
+        # 2.2 tiles apart: far enough that the bodies stay separate blobs at
+        # plate resolution, close enough to still read as one deploy.
+        tiles = [((5.0 + j * 2.2, 26.0 - i * 0.8), "hostile") for j in range(3)]
         frame, _ = render_scene_with_bodies(arena, tiles)
         plate.update(frame)
         found.extend(discoverer.observe(frame, now=i * 0.05))
@@ -244,3 +247,72 @@ def test_discovery_never_names_a_card(arena, plate):
 
     assert found
     assert all(d.card == "" for d in found)
+
+
+# ------------------------------------------- the plate/frame coordinate seam
+
+
+def test_boxes_are_in_frame_coordinates_whatever_the_downsample(arena):
+    """The invariant the whole downsample optimisation rests on.
+
+    Tracking happens at plate resolution because that is where the mask is,
+    but nothing outside `EntityDiscoverer` may see plate coordinates. A leak
+    would put every overlay box and every tile projection off by the
+    downsample factor — which looks exactly like a homography calibration
+    error and would be debugged as one.
+    """
+    boxes = {}
+    for step in (1, 2):
+        running = RunningPlate(PlateConfig(warmup_frames=40, downsample=step))
+        for frame in warmup_frames(arena, count=60):
+            running.update(frame)
+        found = _walk(EntityDiscoverer(running, config=CONFIG), running, arena,
+                      (9.0, 26.0), (0.0, -0.8))
+        assert found, f"nothing discovered at downsample={step}"
+        boxes[step] = found[0]
+
+    full, half = boxes[1], boxes[2]
+    # Within the quantisation the coarser plate imposes, not within a factor
+    # of two — a factor of two is what a leak would look like.
+    assert abs(half.x0 - full.x0) <= 2 * 2
+    assert abs(half.y1 - full.y1) <= 2 * 2
+    assert half.x1 > half.x0 and half.y1 > half.y0
+
+
+def test_the_crop_is_cut_at_full_resolution(arena):
+    """Sprites feed the detector's training data, so the crop comes from the
+    real frame even though the mask that found it does not."""
+    running = RunningPlate(PlateConfig(warmup_frames=40, downsample=2))
+    for frame in warmup_frames(arena, count=60):
+        running.update(frame)
+
+    found = _walk(EntityDiscoverer(running, config=CONFIG), running, arena,
+                  (9.0, 26.0), (0.0, -0.8))
+
+    assert found
+    discovery = found[0]
+    assert discovery.rgb.shape[:2] == discovery.alpha.shape
+    assert discovery.rgb.shape[0] == int(discovery.y1 - discovery.y0)
+    assert discovery.rgb.shape[1] == int(discovery.x1 - discovery.x0)
+
+
+def test_a_swarm_is_not_merged_by_the_coarser_plate(arena):
+    """`close_radius` is a frame-pixel threshold applied to a plate-
+    resolution mask, so it has to shrink with the plate. Unscaled it is
+    `downsample` times too aggressive and glues neighbouring units into one
+    blob, destroying the spawn count — the single most useful thing geometry
+    offers about a deploy."""
+    running = RunningPlate(PlateConfig(warmup_frames=40, downsample=2))
+    for frame in warmup_frames(arena, count=60):
+        running.update(frame)
+    discoverer = EntityDiscoverer(running, config=CONFIG)
+
+    found = []
+    for i in range(10):
+        tiles = [((5.0 + j * 2.2, 26.0 - i * 0.8), "hostile") for j in range(3)]
+        frame, _ = render_scene_with_bodies(arena, tiles)
+        running.update(frame)
+        found.extend(discoverer.observe(frame, now=i * 0.05))
+
+    assert found
+    assert {d.count for d in found} == {3}

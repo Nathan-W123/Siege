@@ -124,6 +124,18 @@ class WindowsDesktopDevice:
         self._cached_viewport: tuple[int, int, int, int] | None = None
         self._touch_injection_ready = False
 
+    @property
+    def capture_origin(self) -> tuple[int, int]:
+        """Screen position of the captured frame's top-left pixel.
+
+        Updated by `screenshot`, so it describes the most recent capture.
+        The overlay pins itself here rather than to the window rect: the
+        capture is the window's client area *minus whatever letterboxing was
+        trimmed*, and using the window rect instead would offset every box by
+        the trim in a way that looks like a homography error.
+        """
+        return self._capture_origin
+
     def screenshot(self) -> Image.Image:
         try:
             if self.capture_mode == "virtual_desktop":

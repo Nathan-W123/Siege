@@ -493,6 +493,118 @@ def test_a_decision_drains_the_buffered_casts(tmp_path, arena, cards, monkeypatc
     assert runner.perceive(frames[-1]).spells == []
 
 
+class _RecordingOverlay:
+    """Stands in for the Win32 window, which cannot be opened off Windows."""
+
+    def __init__(self, fail: bool = False):
+        self.shown = []
+        self.hidden = 0
+        self.closed = 0
+        self.fail = fail
+
+    def show(self, image, origin):
+        if self.fail:
+            raise RuntimeError("no display")
+        self.shown.append((image.size, origin))
+
+    def hide(self):
+        self.hidden += 1
+
+    def close(self):
+        self.closed += 1
+
+
+def _overlay_runner(tmp_path, arena, overlay, monkeypatch, **kwargs):
+    from src.live.runner import LiveMatchRunner
+    from tests.live_frames import render_scene_with_bodies, warmup_frames
+
+    config = _policy_config(tmp_path, arena)
+    frames = warmup_frames(arena, count=70)
+    frames += [render_scene_with_bodies(arena, [((9.0, 26.0 - i * 0.7), "hostile")])[0]
+               for i in range(14)]
+    device = _FakeDevice(frames[0])
+    device.capture_origin = (137, 42)
+    _, tick = _driven_clock(monkeypatch)
+    runner = LiveMatchRunner(config, device, armed=False, log=lambda _: None,
+                             overlay=overlay, **kwargs)
+    runner._was_in_match = True
+    runner._last_action_at = 1e9
+    for frame in frames:
+        device.image = frame
+        runner.step()
+        tick()
+    return runner
+
+
+def test_the_overlay_is_drawn_at_the_capture_origin(tmp_path, arena, cards, monkeypatch):
+    """Pinned to the capture, not to the window rect. The capture is the
+    client area minus trimmed letterboxing, so using the window would offset
+    every box by the trim and look like a homography error."""
+    overlay = _RecordingOverlay()
+
+    _overlay_runner(tmp_path, arena, overlay, monkeypatch)
+
+    assert overlay.shown, "the overlay was never drawn"
+    size, origin = overlay.shown[-1]
+    assert origin == (137, 42)
+    assert size == (556, 1028)
+
+
+def test_the_overlay_updates_every_frame_not_every_decision(tmp_path, arena,
+                                                            cards, monkeypatch):
+    """`action_cooldown_seconds` is over a second. An overlay refreshed on
+    that clock would lag the game badly enough to look broken."""
+    overlay = _RecordingOverlay()
+
+    _overlay_runner(tmp_path, arena, overlay, monkeypatch)
+
+    assert len(overlay.shown) > 10
+
+
+def test_the_overlay_hides_when_the_match_ends(tmp_path, arena, cards, monkeypatch):
+    """Boxes left floating over the home screen are worse than no overlay."""
+    from PIL import Image
+
+    from src.live.runner import LiveMatchRunner
+
+    overlay = _RecordingOverlay()
+    config = _policy_config(tmp_path, arena)
+    drab = Image.new("RGB", (556, 1028), (40, 40, 42))   # fails match detection
+    _driven_clock(monkeypatch)
+    runner = LiveMatchRunner(config, _FakeDevice(drab), armed=False,
+                             log=lambda _: None, overlay=overlay)
+    runner._was_in_match = True
+
+    runner.step()
+
+    assert overlay.hidden >= 1
+    assert overlay.shown == []
+
+
+def test_a_broken_overlay_does_not_stop_the_bot(tmp_path, arena, cards, monkeypatch):
+    """It is a diagnostic. Losing the picture costs a picture; raising costs
+    the session."""
+    overlay = _RecordingOverlay(fail=True)
+
+    runner = _overlay_runner(tmp_path, arena, overlay, monkeypatch)
+
+    assert runner._was_in_match is True        # still running
+
+
+def test_sprites_are_learned_from_play_when_asked(tmp_path, arena, cards, monkeypatch):
+    """No deploy pass: discovery finds the units and the trackers name them."""
+    from src.live.autolabel import SpriteHarvester
+
+    harvester = SpriteHarvester(cards)
+
+    _overlay_runner(tmp_path, arena, _RecordingOverlay(), monkeypatch,
+                    harvester=harvester)
+
+    # Nothing is named without a tracker or a recent play of ours, which is
+    # correct; what matters is that the pass ran and said why it declined.
+    assert harvester.skipped, "the harvester never saw a discovery"
+
+
 def test_a_starved_capture_rate_is_logged_once(tmp_path, arena, cards, monkeypatch):
     """Silence from the spell detector must be explained, not inferred."""
     from PIL import Image

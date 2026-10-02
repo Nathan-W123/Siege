@@ -27,8 +27,14 @@ def plate(arena):
 def test_it_converges_on_the_empty_arena_nobody_recorded(arena, plate):
     """The claim that removes a setup step: every pixel of the playfield is
     background most of the time, so the running median is the empty arena
-    whether or not anyone staged one."""
-    empty = np.asarray(render_empty(arena)[0]).astype(int)
+    whether or not anyone staged one.
+
+    Compared at plate resolution, which is the documented contract — the
+    plate is kept at 1/`downsample` because that is the biggest lever on the
+    live frame budget.
+    """
+    step = plate.scale
+    empty = np.asarray(render_empty(arena)[0])[::step, ::step, :3].astype(int)
 
     assert np.abs(plate.plate.astype(int) - empty).mean() < 1.0
 
@@ -94,7 +100,9 @@ def test_background_that_never_settles_is_excluded(arena):
             rng.normal(120, 40, (40, base.shape[1], 3)), 0, 255).astype(np.uint8)
         running.update(Image.fromarray(frame))
 
-    restless = running.unstable()
+    # Through `upsample`, so the assertion stays in frame coordinates and
+    # the round trip back out of plate resolution is exercised too.
+    restless = running.upsample(running.unstable())
     assert restless[500:540, :].mean() > 0.8, "the animated band was not flagged"
     assert restless[600:640, :].mean() < 0.2, "static arena was flagged restless"
 
@@ -113,7 +121,8 @@ def test_a_restless_region_is_kept_out_of_the_foreground(arena):
     probe = base.copy()
     probe[500:540, :] = 40
 
-    assert running.foreground(Image.fromarray(probe))[500:540, :].sum() == 0
+    mask = running.upsample(running.foreground(Image.fromarray(probe)))
+    assert mask[500:540, :].sum() == 0
 
 
 def test_a_resized_capture_is_refused_not_misread(arena, plate):
@@ -138,5 +147,6 @@ def test_a_changed_capture_size_reseeds_rather_than_crashing(arena, plate):
 
     plate.update(small)
 
-    assert plate.plate.shape[:2] == (514, 278)
+    step = plate.scale
+    assert plate.plate.shape[:2] == (514 // step, 278 // step)
     assert plate.frames == 1

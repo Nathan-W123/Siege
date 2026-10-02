@@ -56,6 +56,18 @@ class PlateConfig:
     # Levels the estimate moves per frame once it is trusted. 1 is the
     # textbook Σ-Δ rate: slow enough that a unit pausing for a second barely
     # moves the estimate, which is the whole point of a median.
+    # Work at 1/N resolution. This is the single biggest lever on the live
+    # frame budget -- halving each dimension is four times less work in
+    # every pass -- and detection does not need full resolution: a box two
+    # pixels out is invisible on an overlay and a fraction of a tile once
+    # projected.
+    #
+    # It is not free. Sprite alpha is cut from this mask, so at N=2 a
+    # harvested silhouette has stair-stepped edges, which composites into
+    # slightly worse training data. N=1 keeps full fidelity and costs about
+    # four times as much per frame; raise N when the measured frame rate
+    # matters more than the sprite edges.
+    downsample: int = 2
     rate: int = 1
     # ...and the rate while still warming up, which has a different job.
     #
@@ -89,6 +101,12 @@ class PlateConfig:
     # on one frame in this many, so anything genuinely permanent is absorbed
     # roughly this many times slower than the scene around it.
     absorb_every: int = 8
+    # Frames between recomputations of the restlessness map. It is a running
+    # median of frame-to-frame change, so it moves slowly by construction --
+    # and taking a global median over a full-resolution frame was by far the
+    # most expensive thing in the live loop. Recomputing it a couple of times
+    # a second is indistinguishable in behaviour and nearly free.
+    volatility_every: int = 20
     # How many times the frame's *typical* deviation a pixel may show before
     # it counts as never having settled. Relative to the frame rather than
     # absolute, so a noisy capture raises the bar for every pixel together
@@ -113,12 +131,16 @@ class RunningPlate:
         self._plate: np.ndarray | None = None
         self._deviation: np.ndarray | None = None
         self._previous: np.ndarray | None = None
+        self._unstable: np.ndarray | None = None
+        self._unstable_at = -1
         self.frames = 0
 
     def reset(self) -> None:
         self._plate = None
         self._deviation = None
         self._previous = None
+        self._unstable = None
+        self._unstable_at = -1
         self.frames = 0
 
     @property
@@ -135,9 +157,29 @@ class RunningPlate:
         """Per-pixel running median of frame-to-frame change."""
         return None if self._deviation is None else self._deviation.copy()
 
+    @property
+    def scale(self) -> int:
+        """Pixels of the original frame per pixel of the plate."""
+        return max(1, self.config.downsample)
+
+    def _reduce(self, frame) -> np.ndarray:
+        """The frame at plate resolution.
+
+        Strided slicing rather than an interpolating resize: point sampling
+        a background estimate is exactly as valid as averaging it, and the
+        resize would cost more than everything it feeds.
+        """
+        step = self.scale
+        return np.asarray(frame)[::step, ::step, :3].astype(np.int16)
+
+    def upsample(self, mask: np.ndarray) -> np.ndarray:
+        """A plate-resolution mask back at frame resolution."""
+        step = self.scale
+        return mask if step == 1 else np.repeat(np.repeat(mask, step, 0), step, 1)
+
     def update(self, frame) -> None:
         """Fold one capture into the estimate."""
-        array = np.asarray(frame)[:, :, :3].astype(np.int16)
+        array = self._reduce(frame)
         if self._plate is None or self._plate.shape != array.shape:
             # Seeding from the frame rather than from zero: the estimator
             # only has to travel where this frame held a unit, instead of
@@ -149,8 +191,11 @@ class RunningPlate:
             return
 
         cfg = self.config
-        delta = np.abs(array - self._plate).max(axis=2)
-        foreground = delta >= cfg.foreground_delta
+        # Derive both the foreground test and the update step from one
+        # subtraction. At full resolution each extra pass over the frame is
+        # a measurable slice of the per-frame budget.
+        diff = array - self._plate
+        foreground = np.abs(diff).max(axis=2) >= cfg.foreground_delta
 
         warming = self.frames < cfg.warmup_frames
         # An absorb frame suspends the foreground rule, so that anything
@@ -161,7 +206,7 @@ class RunningPlate:
         learn_everywhere = warming or absorbing
 
         rate = cfg.warmup_rate if warming else cfg.rate
-        step = np.sign(array - self._plate).astype(np.int16) * rate
+        step = np.sign(diff).astype(np.int16) * rate
         if learn_everywhere:
             self._plate = np.clip(self._plate + step, 0, 255)
         else:
@@ -190,20 +235,30 @@ class RunningPlate:
         if self._deviation is None:
             return None
         cfg = self.config
+        fresh = self.frames - self._unstable_at
+        if self._unstable is not None and fresh < max(1, cfg.volatility_every):
+            return self._unstable
         worst = self._deviation.max(axis=2)
         typical = float(np.median(worst))
         threshold = max(cfg.min_volatility, cfg.volatility_tolerance * typical)
-        return worst > threshold
+        self._unstable = worst > threshold
+        self._unstable_at = self.frames
+        return self._unstable
 
     def foreground(self, frame, min_delta: float | None = None) -> np.ndarray | None:
         """What is on the arena now that is not part of the settled scene.
+
+        Returned at **plate resolution**, not frame resolution — see
+        `PlateConfig.downsample`. Callers that need frame coordinates
+        multiply by `scale`, and callers that need a frame-sized mask pass it
+        through `upsample`.
 
         None until the plate has warmed up — an honest "I cannot tell yet",
         rather than a mask full of afterimages that looks like a busy board.
         """
         if not self.ready:
             return None
-        array = np.asarray(frame)[:, :, :3].astype(np.int16)
+        array = self._reduce(frame)
         if array.shape != self._plate.shape:
             return None
         delta = np.abs(array - self._plate).max(axis=2)

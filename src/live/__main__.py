@@ -55,6 +55,18 @@ def main() -> None:
              "exercise the whole perception stack offline, as many times as "
              "you like, without the game running.")
     parser.add_argument("--record-out", type=Path, default=Path("recordings/session"))
+    parser.add_argument(
+        "--overlay", action="store_true",
+        help="draw thin boxes over the game around every detected unit, "
+             "blue for yours and red for theirs, labelled with the card and "
+             "confidence where identity is known. Windows only; use "
+             "`python -m src.live.replay --annotate` to see the same boxes "
+             "on recorded frames anywhere.")
+    parser.add_argument(
+        "--learn-sprites", type=Path, default=None, metavar="DIR",
+        help="grow a sprite library from this session's play and save it "
+             "here on exit. Needs no deploy pass: our cards are named by the "
+             "hand cycle, theirs by the opponent tracker's deduction.")
     parser.add_argument("--record-interval", type=float, default=0.05,
                         help="seconds between recorded frames (default 20fps). "
                              "Faster than `poll_seconds` on purpose: spell "
@@ -94,14 +106,56 @@ def main() -> None:
                          activity="live")
         log = telemetry.TeeLogger()
 
+    overlay = _build_overlay(args.overlay, log)
+    harvester = _build_harvester(args.learn_sprites, log)
     driver = _build_driver(config, args.checkpoint, log)
     if driver is not None:
         # No-op unless --viz-port opened a viewer. With one, the 3D graph
         # animates from the same forward passes that choose the real taps.
         viz.attach_live_driver(driver, label="live policy")
 
-    runner = LiveMatchRunner(config, device, armed=args.armed, log=log, driver=driver)
-    runner.run_forever()
+    runner = LiveMatchRunner(config, device, armed=args.armed, log=log,
+                             driver=driver, overlay=overlay, harvester=harvester)
+    try:
+        runner.run_forever()
+    finally:
+        if overlay is not None:
+            overlay.close()
+        if harvester is not None and len(harvester.library):
+            harvester.library.save(args.learn_sprites)
+            log(f"Saved {len(harvester.library)} sprites across "
+                f"{len(harvester.library.cards)} cards -> {args.learn_sprites}")
+
+
+def _build_overlay(enabled: bool, log):
+    """The on-screen overlay, or None.
+
+    A failure here is never fatal. The overlay is a diagnostic; losing it
+    costs you a picture, while raising costs you the session.
+    """
+    if not enabled:
+        return None
+    from src.live.overlay import Win32Overlay
+
+    try:
+        overlay = Win32Overlay()
+    except RuntimeError as error:
+        log(f"Overlay unavailable: {error}")
+        return None
+    log("Overlay on: blue = yours, red = theirs, `card 0.87` named, "
+        "`troop ?` found but not identified.")
+    return overlay
+
+
+def _build_harvester(out_dir, log):
+    """The sprite library this session will grow, or None."""
+    if out_dir is None:
+        return None
+    from src.live.autolabel import SpriteHarvester
+    from src.simulator.cards import load_cards
+
+    log(f"Learning sprites from play; they will be written to {out_dir}.")
+    return SpriteHarvester(load_cards())
 
 
 def _build_driver(config, checkpoint_override, log):

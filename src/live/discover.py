@@ -143,6 +143,40 @@ class Discovery:
             facing=FACING_AWAY if team == TEAM_FRIENDLY else FACING_TOWARD)
 
 
+@dataclass(frozen=True)
+class LiveEntity:
+    """What is on the arena *right now*, for drawing rather than for learning.
+
+    `observe` reports each entity once, at the moment it settles, because
+    that is when the motion question can finally be answered. An overlay
+    needs the opposite: every tracked thing, every frame, from the moment it
+    appears. So this carries no crop and no alpha — building those per unit
+    per frame would cost more than everything else in the loop combined —
+    and it carries `kind` and `team` as `None` until the track has actually
+    earned them.
+
+    None is the honest value there. A unit that has not moved yet is
+    indistinguishable from a building, and flickering a label between the
+    two every time someone stops to attack is worse than admitting the
+    answer is not in yet.
+    """
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    kind: CardType | None = None
+    team: str | None = None
+    settled: bool = False
+    card: str = ""
+    score: float = 1.0
+    identity_score: float = 0.0
+
+    @property
+    def feet(self) -> tuple[float, float]:
+        return ((self.x0 + self.x1) / 2.0, self.y1)
+
+
 @dataclass
 class _Track:
     x: float
@@ -154,6 +188,7 @@ class _Track:
     group: int
     frames: int = 0
     missed: int = 0
+    emitted: bool = False
 
 
 class EntityDiscoverer:
@@ -188,31 +223,46 @@ class EntityDiscoverer:
         cfg = self.config
         if self.plate is None:
             return []
+        scale = self.plate.scale
         mask = self.plate.foreground(frame, cfg.min_delta)
         if mask is None:
             # The plate is still warming up. Feeding the caller an empty list
             # is right; feeding it afterimages would not be.
             return []
-        mask = close_mask(mask, cfg.close_radius)
+        # close_radius is configured in frame pixels, like every other
+        # distance here, so it has to shrink with the plate. Left unscaled it
+        # is `downsample` times too aggressive and merges neighbouring units
+        # into one blob -- which destroys the spawn count, the single most
+        # useful thing geometry offers about a deploy.
+        mask = close_mask(mask, max(1, round(cfg.close_radius / scale)))
 
         height, width = mask.shape
+        # Areas and extents are configured in frame pixels; the mask is at
+        # plate resolution, so the area threshold shrinks by scale squared.
+        min_area = max(1, int(cfg.min_area / (scale * scale)))
         blobs = [b for b in connected_components(mask)
-                 if b.area >= cfg.min_area
+                 if b.area >= min_area
                  and b.height <= height * cfg.max_extent_fraction
                  and b.width <= width * cfg.max_extent_fraction]
 
         emitted = self._advance(frame, mask, blobs, now)
+        # `max_age` retires tracks that never settled — those are noise. A
+        # track that *did* settle lives until it is lost, because a Giant is
+        # on the board for half a minute and must not be rediscovered as a
+        # fresh spawn every few seconds.
         self._tracks = [t for t in self._tracks
-                        if t.missed <= 2 and now - t.first_seen <= cfg.max_age]
+                        if t.missed <= 2
+                        and (t.emitted or now - t.first_seen <= cfg.max_age)]
         return emitted
 
     def _advance(self, frame, mask, blobs, now: float) -> list[Discovery]:
         cfg = self.config
+        scale = self.plate.scale
         unmatched = list(blobs)
         ready: list[_Track] = []
 
         for track in self._tracks:
-            best, best_d = None, cfg.max_drift_px
+            best, best_d = None, cfg.max_drift_px / scale
             for blob in unmatched:
                 cx, cy = blob.center
                 d = float(np.hypot(cx - track.x, cy - track.y))
@@ -226,7 +276,8 @@ class EntityDiscoverer:
             track.frames += 1
             track.x, track.y = best.center
             track.blob = best
-            if track.frames >= cfg.settle_frames:
+            if track.frames >= cfg.settle_frames and not track.emitted:
+                track.emitted = True
                 ready.append(track)
 
         self._admit(unmatched, now)
@@ -239,7 +290,12 @@ class EntityDiscoverer:
         for track in self._tracks:
             sizes[track.group] = sizes.get(track.group, 0) + 1
 
-        self._tracks = [t for t in self._tracks if t not in ready]
+        # Emitted tracks stay. Dropping them was a real bug: the blob is
+        # still on screen, so the next frame admits it as a brand-new track
+        # and it settles and reports again a few frames later, for as long
+        # as the unit lives. Keeping them also lets `current` draw an
+        # overlay, which needs every tracked thing every frame rather than
+        # one report per lifetime.
         return [self._describe(frame, mask, t, sizes.get(t.group, 1)) for t in ready]
 
     def _admit(self, blobs, now: float) -> None:
@@ -247,12 +303,13 @@ class EntityDiscoverer:
         that appeared together — a swarm is one deploy, and its size is the
         single most useful thing about it."""
         cfg = self.config
+        radius = cfg.group_radius_px / self.plate.scale
         fresh: list[list] = []
         for blob in blobs:
             cx, cy = blob.center
             for group in fresh:
                 if any(np.hypot(cx - o.center[0], cy - o.center[1])
-                       <= cfg.group_radius_px for o in group):
+                       <= radius for o in group):
                     group.append(blob)
                     break
             else:
@@ -266,24 +323,65 @@ class EntityDiscoverer:
                 self._tracks.append(_Track(x=cx, y=cy, blob=blob, first_x=cx,
                                            first_y=cy, first_seen=now, group=gid))
 
+    def current(self, frame=None) -> list[LiveEntity]:
+        """Everything being tracked this frame, settled or not.
+
+        Driven by the last `observe`, so it costs almost nothing: the tracks
+        are already there and this reads their present boxes. An overlay
+        calls it every frame; nothing else needs it.
+        """
+        scale = self.plate.scale
+        out: list[LiveEntity] = []
+        for track in self._tracks:
+            settled = track.frames >= self.config.settle_frames
+            kind = team = None
+            if settled:
+                dy = (track.y - track.first_y) * scale
+                travel = float(np.hypot((track.x - track.first_x) * scale, dy))
+                kind = (CardType.TROOP if travel > self.config.static_px
+                        else CardType.BUILDING)
+                team, _ = self._team(frame, track, dy, kind) if frame is not None \
+                    else (None, "")
+            blob = track.blob
+            out.append(LiveEntity(
+                x0=float(blob.x0 * scale), y0=float(blob.y0 * scale),
+                x1=float((blob.x1 + 1) * scale), y1=float((blob.y1 + 1) * scale),
+                kind=kind, team=team, settled=settled))
+        return out
+
     # ------------------------------------------------------------ describing
 
     def _describe(self, frame, mask, track: _Track, count: int) -> Discovery:
+        """One settled track, in **frame** coordinates.
+
+        Tracking happens at plate resolution because that is where the mask
+        is, but nothing outside this class should have to know that: a
+        Discovery's box is in captured-frame pixels, and its crop is cut from
+        the full-resolution frame. Leaking plate coordinates out of here
+        would put every overlay box and every tile projection off by the
+        downsample factor, which looks like a calibration error.
+        """
         cfg = self.config
-        dx = track.x - track.first_x
-        dy = track.y - track.first_y
+        scale = self.plate.scale
+        dx = (track.x - track.first_x) * scale
+        dy = (track.y - track.first_y) * scale
         travel = float(np.hypot(dx, dy))
         kind = CardType.TROOP if travel > cfg.static_px else CardType.BUILDING
 
         team, source = self._team(frame, track, dy, kind)
         blob = track.blob
         array = np.asarray(frame)[:, :, :3]
-        window = (slice(blob.y0, blob.y1 + 1), slice(blob.x0, blob.x1 + 1))
-        alpha = mask[window]
+        x0, y0 = blob.x0 * scale, blob.y0 * scale
+        x1, y1 = (blob.x1 + 1) * scale, (blob.y1 + 1) * scale
+        window = (slice(y0, y1), slice(x0, x1))
+        # Alpha comes from the plate-resolution mask stretched back up, so at
+        # a downsample above 1 the silhouette edge is stair-stepped. That is
+        # the documented cost of the speed; see `PlateConfig.downsample`.
+        alpha = self.plate.upsample(mask)[window]
 
         return Discovery(
-            kind=kind, team=team, x0=float(blob.x0), y0=float(blob.y0),
-            x1=float(blob.x1 + 1), y1=float(blob.y1 + 1),
+            kind=kind, team=team, x0=float(x0), y0=float(y0),
+            x1=float(x1), y1=float(y1),
             rgb=array[window].copy(), alpha=alpha.copy(),
             count=count, team_source=source, travel_px=travel)
 
@@ -324,8 +422,10 @@ class EntityDiscoverer:
         path whose constants shift with every skin; motion does not.
         """
         blob = track.blob
+        scale = self.plate.scale
         array = np.asarray(frame)[:, :, :3]
-        window = (slice(blob.y0, blob.y1 + 1), slice(blob.x0, blob.x1 + 1))
+        window = (slice(blob.y0 * scale, (blob.y1 + 1) * scale),
+                  slice(blob.x0 * scale, (blob.x1 + 1) * scale))
         crop = array[window]
         if crop.size == 0:
             return None

@@ -142,12 +142,23 @@ def _shifted(mask: np.ndarray, dy: int, dx: int) -> np.ndarray:
 
 
 def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Dilate by a square structuring element, separably.
+
+    A square factorises into a vertical pass and a horizontal one, so this
+    costs 2*(2r+1) shifts rather than (2r+1)**2 -- 14 instead of 49 at the
+    default radius. It matters because this runs twice per close, on a
+    full-resolution frame, inside a real-time loop.
+    """
     if radius <= 0:
         return mask
-    out = mask.copy()
+    rows = mask.copy()
     for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            out |= _shifted(mask, dy, dx)
+        if dy:
+            rows |= _shifted(mask, dy, 0)
+    out = rows.copy()
+    for dx in range(-radius, radius + 1):
+        if dx:
+            out |= _shifted(rows, 0, dx)
     return out
 
 

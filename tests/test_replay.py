@@ -239,3 +239,40 @@ def test_recorded_names_sort_in_capture_order(tmp_path):
     names = [p.name for p in frame_paths(tmp_path)]
     assert names == sorted(names)
     assert names[0] == "frame_000000.png"
+
+
+# ---------------------------------------------------------------- annotate
+
+
+def test_annotated_frames_are_written_for_every_frame(arena, recording, tmp_path):
+    """The way to check the overlay without the game, and the only way to
+    check it at all off Windows."""
+    frames_dir, meta = recording
+    out = tmp_path / "annotated"
+
+    replay(frames_dir, homography=_homography(arena, meta), arena=arena,
+           plate_config=PLATE, discover_config=DISCOVER, annotate=out)
+
+    written = sorted(out.glob("*.png"))
+    assert len(written) == len(frame_paths(frames_dir))
+    with Image.open(written[0]) as first:
+        assert first.size == (556, 1028)
+
+
+def test_annotation_draws_the_boxes_it_is_tracking(arena, recording, tmp_path):
+    """Drawn from what is tracked right now, not from settle reports — those
+    fire once per entity, which would leave nearly every frame bare."""
+    import numpy as np
+
+    frames_dir, meta = recording
+    out = tmp_path / "annotated"
+
+    replay(frames_dir, homography=_homography(arena, meta), arena=arena,
+           plate_config=PLATE, discover_config=DISCOVER, annotate=out)
+
+    source = frame_paths(frames_dir)
+    late = sorted(out.glob("*.png"))[-1]
+    with Image.open(late) as drawn, Image.open(source[-1]) as original:
+        changed = (np.asarray(drawn.convert("RGB")).astype(int)
+                   != np.asarray(original.convert("RGB")).astype(int)).any(axis=2)
+    assert changed.sum() > 0, "nothing was drawn on a frame with units on it"

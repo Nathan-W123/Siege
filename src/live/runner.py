@@ -7,6 +7,8 @@ from typing import Callable
 
 from src.live.config import LiveConfig, Rect
 from src.live.device import LiveDevice
+from src.live.background import RunningPlate
+from src.live.discover import DiscoverConfig, EntityDiscoverer
 from src.live.spells import SpellConfig, SpellWatcher
 from src.live.vision import mean_luma, mean_saturation
 
@@ -58,7 +60,8 @@ class LiveMatchRunner:
     """
 
     def __init__(self, config: LiveConfig, device: LiveDevice, armed: bool = False,
-                 log: Callable[[str], None] = print, driver=None):
+                 log: Callable[[str], None] = print, driver=None,
+                 overlay=None, harvester=None):
         self.config = config
         self.device = device
         self.armed = armed
@@ -75,6 +78,17 @@ class LiveMatchRunner:
         # Spells are detected across frames, not within one, so the watcher
         # is long-lived state on the runner rather than a per-frame call.
         self.spell_watcher = SpellWatcher(self.homography, config=SpellConfig())
+        # Model-free perception, which runs whether or not a detector has
+        # ever been trained: the plate learns the empty arena from play and
+        # the discoverer finds entities by motion (src/live/discover.py).
+        self.plate = RunningPlate()
+        self.discoverer = EntityDiscoverer(self.plate, homography=self.homography,
+                                           config=DiscoverConfig())
+        # A `src.live.overlay.Win32Overlay` when asked for; None otherwise.
+        self.overlay = overlay
+        # A `src.live.autolabel.SpriteHarvester` when the session is learning.
+        self.harvester = harvester
+        self._last_play: tuple[str, float] | None = None
         # Events accumulate between decisions, because the watcher is fed on
         # every capture but drained only when a decision is made.
         self._spell_events: list = []
@@ -159,6 +173,52 @@ class LiveMatchRunner:
                 f"spell detection needs "
                 f"{self.spell_watcher.config.max_frame_interval:.2f}s or less. "
                 "Lower `poll_seconds`, or expect no spells to be reported.")
+
+    def _observe_entities(self, image) -> None:
+        """Run model-free perception and draw the overlay, every frame.
+
+        Here rather than in `perceive` for the same reason the spell watcher
+        is: perception runs when a decision is due, while tracking needs
+        every frame. An overlay updated once per decision would lag the game
+        by `action_cooldown_seconds`, which is over a second by default and
+        would look broken.
+
+        Nothing here can be allowed to take the runner down. A failed
+        overlay draw means a missing picture; a raised exception means the
+        bot stops playing, which is a far worse trade for a diagnostic.
+        """
+        try:
+            self.plate.update(image)
+            discovered = self.discoverer.observe(image, now=time.monotonic())
+            if self.harvester is not None and discovered:
+                self._learn(discovered)
+            if self.overlay is not None:
+                self._draw_overlay(image)
+        except (ValueError, OSError, RuntimeError) as error:
+            if not self._degraded:
+                self.log(f"Perception overlay degraded: {error}")
+
+    def _learn(self, discovered) -> None:
+        """Bank named sprites from this frame's settled discoveries.
+
+        Our own deploys are named by the hand cycle, but only while the tap
+        that produced them is recent: a Witch's skeletons and a hut's goblins
+        appear with no tap at all, and attributing those to whatever we last
+        played would file one card's pixels under another's name.
+        """
+        own = None
+        if self._last_play is not None:
+            card, at = self._last_play
+            if time.monotonic() - at <= 3.0:
+                own = card
+        self.harvester.observe(discovered, own_card=own)
+
+    def _draw_overlay(self, image) -> None:
+        from src.live.overlay import boxes_for, render
+
+        entities = self.discoverer.current(image)
+        origin = getattr(self.device, "capture_origin", (0, 0))
+        self.overlay.show(render(image.size, boxes_for(entities)), origin)
 
     def _drain_spells(self) -> list:
         """Spell casts buffered since the last decision.
@@ -253,6 +313,9 @@ class LiveMatchRunner:
             # against the new board, at a tile that means nothing there.
             self.spell_watcher.reset()
             self._spell_events = []
+            self.plate.reset()
+            self.discoverer.reset()
+            self._last_play = None
             self.log("Match detected; hand cycle reset.")
         self._was_in_match = in_match
 
@@ -262,6 +325,9 @@ class LiveMatchRunner:
         # the frames we act on would miss every cast in the match.
         if in_match:
             self._observe_spells(image)
+            self._observe_entities(image)
+        elif self.overlay is not None:
+            self.overlay.hide()
 
         if not in_match or time.monotonic() - self._last_action_at < self.config.action_cooldown_seconds:
             return
@@ -294,6 +360,7 @@ class LiveMatchRunner:
             self.device.tap(*target)
             if self.config.decision_mode == "known_deck":
                 self.hand.play(slot)
+            self._last_play = (card, time.monotonic())
         else:
             self._last_logged_choice = choice
         self._last_action_at = time.monotonic()
@@ -337,6 +404,7 @@ class LiveMatchRunner:
             # out; advancing on a dry run would desynchronise the hand from
             # the game for the rest of the match.
             self.hand.play(action.slot)
+            self._last_play = (action.card, time.monotonic())
         self._last_action_at = time.monotonic()
         return True
 

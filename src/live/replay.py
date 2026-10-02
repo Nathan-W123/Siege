@@ -190,8 +190,14 @@ def replay(
     discover_config: DiscoverConfig | None = None,
     spell_config: SpellConfig | None = None,
     save_sprites: Path | str | None = None,
+    annotate: Path | str | None = None,
 ) -> tuple[ReplayReport, SpriteHarvester | None]:
     """Run the whole perception stack over recorded frames.
+
+    `annotate` writes every frame with the overlay drawn on it — the same
+    boxes, colours and labels the live overlay shows. It is the way to check
+    the overlay without the game running, and the way to check it at all on
+    anything but Windows.
 
     `deck` stands in for the opponent tracker, which cannot be reconstructed
     from pixels alone — it needs the play history the live runner feeds it.
@@ -204,6 +210,11 @@ def replay(
     report = ReplayReport(frames=len(paths), capture_interval=interval)
     if not paths:
         return report, None
+
+    annotate_dir = None
+    if annotate is not None:
+        annotate_dir = Path(annotate)
+        annotate_dir.mkdir(parents=True, exist_ok=True)
 
     plate = RunningPlate(plate_config or PlateConfig())
     discoverer = EntityDiscoverer(plate, homography=homography, arena=arena,
@@ -241,6 +252,17 @@ def replay(
                 report.named[sprite.card] += 1
             for reason in harvester.skipped[before:]:
                 report.skipped[reason] += 1
+
+        if annotate_dir is not None:
+            # From `current`, not from `found`: the overlay shows everything
+            # being tracked right now, while `found` is the one report each
+            # entity makes when it settles. Annotating from `found` would
+            # leave almost every frame bare.
+            from src.live.overlay import boxes_for, render
+
+            boxes = boxes_for(discoverer.current(image))
+            render(image.size, boxes, over=image).convert("RGB").save(
+                annotate_dir / path.name)
 
     report.capture_too_slow = watcher.starved
     if save_sprites is not None and harvester is not None:
@@ -300,6 +322,10 @@ def main(argv=None) -> int:
                              "`deck:` from --config.")
     parser.add_argument("--interval", type=float, default=0.05,
                         help="seconds between recorded frames (default 20fps)")
+    parser.add_argument("--annotate", type=Path, default=None, metavar="DIR",
+                        help="write every frame with the overlay drawn on it: "
+                             "the same boxes the live overlay shows, checkable "
+                             "without the game and on any platform")
     parser.add_argument("--save-sprites", type=Path, default=None,
                         help="write every harvested sprite here as a "
                              "transparent PNG, so you can look at them")
@@ -325,7 +351,8 @@ def main(argv=None) -> int:
 
     report, harvester = replay(
         args.frames, cards=cards, homography=homography, arena=arena,
-        deck=deck, interval=args.interval, save_sprites=args.save_sprites)
+        deck=deck, interval=args.interval, save_sprites=args.save_sprites,
+        annotate=args.annotate)
 
     print(format_report(report))
     if harvester is not None and len(harvester.library):
